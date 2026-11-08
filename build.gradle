@@ -1,0 +1,7 @@
+plugins {
+    id 'base'
+}
+allprojects {
+    group = 'ru.javajournal'
+    version = '1.0.1'
+}

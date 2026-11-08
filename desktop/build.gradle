@@ -1,0 +1,146 @@
+plugins {
+    id 'application'
+    id 'org.openjfx.javafxplugin' version '0.1.0'
+}
+
+java {
+    toolchain { languageVersion = JavaLanguageVersion.of(21) }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+javafx {
+    version = '21.0.6'
+    modules = ['javafx.controls']
+}
+
+application {
+    // Отдельная точка входа необходима для портативной немодульной сборки.
+    mainClass = 'ru.javajournal.desktop.JavaJournalLauncher'
+    applicationDefaultJvmArgs = ['-Dfile.encoding=UTF-8']
+}
+
+dependencies {
+    implementation project(':core')
+}
+
+// Номер версии и необязательный GitHub-репозиторий попадают в ресурсы приложения.
+// При смене версии не требуется редактировать Java-классы.
+def buildMetadata = tasks.register('generateBuildMetadata') {
+    def outputDirectory = layout.buildDirectory.dir('generated/buildMetadata')
+    inputs.property('appVersion', project.version.toString())
+    inputs.property('githubRepository', providers.gradleProperty('githubRepository').orElse(''))
+    outputs.dir(outputDirectory)
+    doLast {
+        def out = new File(outputDirectory.get().asFile, 'javajournal-build.properties')
+        out.parentFile.mkdirs()
+        out.text = 'appVersion=' + project.version.toString() + '\n' +
+            'githubRepository=' + providers.gradleProperty('githubRepository').orElse('').get() + '\n'
+    }
+}
+sourceSets.main.resources.srcDir(files(layout.buildDirectory.dir('generated/buildMetadata')))
+tasks.named('processResources') { dependsOn buildMetadata }
+
+// На Windows JDK 21 содержит jpackage. Создаём app-image, а не инсталлятор:
+// готовую папку можно упаковать в ZIP, скопировать и запускать JavaJournal.exe.
+def isWindows = System.getProperty('os.name').toLowerCase(java.util.Locale.ROOT).contains('windows')
+
+tasks.register('packageWindowsImage', Exec) {
+    group = 'distribution'
+    description = 'Создать портативную Windows-папку JavaJournal с локальным Java Runtime (Windows + JDK 21).'
+    dependsOn tasks.named('installDist')
+    onlyIf { isWindows }
+    doFirst {
+        def jpackageDir = file("${layout.buildDirectory.get().asFile}/jpackage")
+        def imageDir = new File(jpackageDir, 'JavaJournal')
+        if (imageDir.exists()) project.delete(imageDir)
+        jpackageDir.mkdirs()
+        def launcher = javaToolchains.launcherFor {
+            languageVersion = JavaLanguageVersion.of(21)
+        }.get()
+        def jpackage = new File(launcher.executablePath.asFile.parentFile, 'jpackage.exe')
+        if (!jpackage.exists()) throw new GradleException('Для EXE нужен полноценный JDK 21 с jpackage.exe.')
+        def inputDir = file("${layout.buildDirectory.get().asFile}/install/desktop/lib")
+        def iconFile = file('javajournal.ico')
+        if (!iconFile.exists()) throw new GradleException('Не найдена иконка desktop/javajournal.ico')
+        commandLine jpackage.absolutePath,
+            '--type', 'app-image',
+            '--name', 'JavaJournal',
+            '--icon', iconFile.absolutePath,
+            '--app-version', project.version.toString(),
+            '--input', inputDir.absolutePath,
+            '--main-jar', "desktop-${project.version}.jar",
+            '--main-class', 'ru.javajournal.desktop.JavaJournalLauncher',
+            '--dest', jpackageDir.absolutePath,
+            '--add-modules', 'java.desktop,java.logging,java.management,java.naming,java.prefs,java.xml,jdk.crypto.ec',
+            '--java-options', '-Dfile.encoding=UTF-8'
+    }
+}
+
+tasks.register('packageWindows', Zip) {
+    group = 'distribution'
+    description = 'ZIP-пакет: распаковать и запустить JavaJournal.exe без отдельной установки Java.'
+    dependsOn tasks.named('packageWindowsImage')
+    onlyIf { isWindows }
+    archiveFileName = "JavaJournal-v${project.version}-windows-portable.zip"
+    destinationDirectory = layout.buildDirectory.dir('distributions')
+    from(layout.buildDirectory.dir('jpackage/JavaJournal')) {
+        into 'JavaJournal'
+    }
+}
+
+// macOS: исполняемый .app вместе с Java Runtime, отдельная сборка для Intel и Apple Silicon.
+// jpackage не поддерживает кросс-компиляцию: выполняем только на Mac нужной архитектуры.
+def isMac = System.getProperty('os.name').toLowerCase(java.util.Locale.ROOT).contains('mac')
+
+tasks.register('packageMacImage', Exec) {
+    group = 'distribution'
+    description = 'Создать JavaJournal.app на macOS (нужен JDK 21 на том же Mac).'
+    dependsOn tasks.named('installDist')
+    onlyIf { isMac }
+    doFirst {
+        def packageDir = file("${layout.buildDirectory.get().asFile}/jpackage-macos")
+        def imageDir = new File(packageDir, 'JavaJournal.app')
+        if (imageDir.exists()) project.delete(imageDir)
+        packageDir.mkdirs()
+        def launcher = javaToolchains.launcherFor {
+            languageVersion = JavaLanguageVersion.of(21)
+        }.get()
+        def jpackage = new File(launcher.executablePath.asFile.parentFile, 'jpackage')
+        if (!jpackage.exists()) throw new GradleException('На macOS требуется JDK 21 с jpackage.')
+        def resources = file('javajournal.icns')
+        if (!resources.isFile()) throw new GradleException('Не найдена иконка desktop/javajournal.icns')
+        commandLine jpackage.absolutePath,
+            '--type', 'app-image',
+            '--name', 'JavaJournal',
+            '--icon', resources.absolutePath,
+            '--app-version', project.version.toString(),
+            '--input', file("${layout.buildDirectory.get().asFile}/install/desktop/lib").absolutePath,
+            '--main-jar', "desktop-${project.version}.jar",
+            '--main-class', 'ru.javajournal.desktop.JavaJournalLauncher',
+            '--dest', packageDir.absolutePath,
+            '--add-modules', 'java.desktop,java.logging,java.management,java.naming,java.prefs,java.xml,jdk.crypto.ec',
+            '--java-options', '-Dfile.encoding=UTF-8'
+    }
+}
+
+tasks.register('packageMac', Exec) {
+    group = 'distribution'
+    description = 'ZIP с JavaJournal.app и сохранением прав исполняемого файла и symlink macOS.'
+    dependsOn tasks.named('packageMacImage')
+    onlyIf { isMac }
+    doFirst {
+        def arch = System.getProperty('os.arch').toLowerCase(java.util.Locale.ROOT)
+        def suffix = arch.contains('aarch64') || arch.contains('arm') ? 'arm64' : 'intel'
+        def outputDir = file("${layout.buildDirectory.get().asFile}/distributions")
+        outputDir.mkdirs()
+        def result = new File(outputDir, "JavaJournal-v${project.version}-macos-${suffix}.zip")
+        if (result.exists()) result.delete()
+        // ditto, в отличие от обычного ZIP, сохраняет macOS app bundle и Unix-права.
+        commandLine 'ditto', '-c', '-k', '--sequesterRsrc', '--keepParent',
+            file("${layout.buildDirectory.get().asFile}/jpackage-macos/JavaJournal.app").absolutePath,
+            result.absolutePath
+    }
+}
