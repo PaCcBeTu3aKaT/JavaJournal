@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="desktop/src/main/resources/icons/javajournal.png" alt="JavaJournal" width="104" height="104"">
+<img src="desktop/src/main/resources/icons/javajournal.png" alt="JavaJournal" width="104" height="104">
 
 # JavaJournal
 
