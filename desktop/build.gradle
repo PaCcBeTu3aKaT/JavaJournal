@@ -74,15 +74,39 @@ tasks.register('packageWindowsImage', Exec) {
             '--main-jar', "desktop-${project.version}.jar",
             '--main-class', 'ru.javajournal.desktop.JavaJournalLauncher',
             '--dest', jpackageDir.absolutePath,
-            '--add-modules', 'java.desktop,java.logging,java.management,java.naming,java.prefs,java.xml,jdk.crypto.ec',
+            '--add-modules', 'java.se,jdk.crypto.ec,jdk.unsupported,jdk.jfr,jdk.charsets,jdk.localedata',
             '--java-options', '-Dfile.encoding=UTF-8'
+    }
+}
+
+// Не публикуем EXE, если jlink исключил модули, используемые зависимостями.
+// Старый портативный релиз содержал урезанный runtime без java.sql и jdk.unsupported.
+tasks.register('verifyWindowsRuntime') {
+    group = 'verification'
+    dependsOn tasks.named('packageWindowsImage')
+    onlyIf { isWindows }
+    doLast {
+        def releaseFile = file("${layout.buildDirectory.get().asFile}/jpackage/JavaJournal/runtime/release")
+        if (!releaseFile.isFile()) {
+            throw new GradleException('У Windows-сборки отсутствует runtime/release.')
+        }
+        def releaseInfo = new Properties()
+        releaseFile.withInputStream { releaseInfo.load(it) }
+        def modules = (releaseInfo.getProperty('MODULES') ?: '').replace('\"', '').split(' ') as Set
+        def expected = ['java.desktop', 'java.net.http', 'java.sql', 'java.logging',
+                        'jdk.crypto.ec', 'jdk.unsupported', 'jdk.jfr', 'jdk.charsets', 'jdk.localedata']
+        def missing = expected.findAll { !modules.contains(it) }
+        if (!missing.isEmpty()) {
+            throw new GradleException('В портативной Java отсутствуют модули: ' + missing.join(', '))
+        }
+        logger.lifecycle('JavaJournal: portable Runtime проверен, модули на месте.')
     }
 }
 
 tasks.register('packageWindows', Zip) {
     group = 'distribution'
     description = 'ZIP-пакет: распаковать и запустить JavaJournal.exe без отдельной установки Java.'
-    dependsOn tasks.named('packageWindowsImage')
+    dependsOn tasks.named('verifyWindowsRuntime')
     onlyIf { isWindows }
     archiveFileName = "JavaJournal-v${project.version}-windows-portable.zip"
     destinationDirectory = layout.buildDirectory.dir('distributions')
@@ -121,7 +145,7 @@ tasks.register('packageMacImage', Exec) {
             '--main-jar', "desktop-${project.version}.jar",
             '--main-class', 'ru.javajournal.desktop.JavaJournalLauncher',
             '--dest', packageDir.absolutePath,
-            '--add-modules', 'java.desktop,java.logging,java.management,java.naming,java.prefs,java.xml,jdk.crypto.ec',
+            '--add-modules', 'java.se,jdk.crypto.ec,jdk.unsupported,jdk.jfr,jdk.charsets,jdk.localedata',
             '--java-options', '-Dfile.encoding=UTF-8'
     }
 }

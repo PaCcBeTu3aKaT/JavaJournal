@@ -1,0 +1,31 @@
+plugins {
+    id 'com.android.application' version '8.9.2'
+}
+
+android {
+    namespace 'ru.javajournal.android'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'ru.javajournal.android'
+        minSdk 26
+        targetSdk 34
+        versionCode 20000
+        versionName project.version.toString()
+    }
+    buildFeatures { buildConfig true }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+        coreLibraryDesugaringEnabled true
+    }
+    packaging {
+        resources.excludes += ['META-INF/LICENSE', 'META-INF/LICENSE.txt', 'META-INF/NOTICE', 'META-INF/NOTICE.txt']
+    }
+}
+
+dependencies {
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'
+    implementation project(':core')
+    implementation 'androidx.activity:activity:1.9.3'
+}

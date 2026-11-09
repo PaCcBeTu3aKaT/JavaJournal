@@ -53,7 +53,7 @@ public final class JournalFilters {
 
     public static List<Grade> grades(List<Grade> grades, LocalDate reference, Period period) {
         return grades.stream().filter(grade -> inPeriod(grade.date(), reference, period))
-            .sorted(Comparator.comparing(Grade::date).reversed()).toList();
+            .sorted(Comparator.comparing(Grade::date).reversed()).collect(java.util.stream.Collectors.toList());
     }
 
     /** Формирует статистику только по занятиям в запрошенном периоде. */
@@ -101,7 +101,7 @@ public final class JournalFilters {
                 .thenComparing(Homework::title, names);
         return homework.stream().sorted(Comparator
             .comparingInt((Homework task) -> homeworkOrder(task.status()))
-            .thenComparing(order)).toList();
+            .thenComparing(order)).collect(java.util.stream.Collectors.toList());
     }
 
     public static Map<HomeworkStatus, List<Homework>> groupedHomework(List<Homework> homework) {

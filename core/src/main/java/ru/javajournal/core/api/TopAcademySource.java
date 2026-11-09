@@ -111,6 +111,20 @@ public final class TopAcademySource implements JournalSource {
         return new TopAcademySource(token, info);
     }
 
+    /** Восстанавливает сессию по сохранённому токену; пароль повторно не передаётся. */
+    public static TopAcademySource restoreSession(String savedToken) throws IOException {
+        if (savedToken == null || savedToken.isBlank()) {
+            throw new AuthException("Сохранённая сессия отсутствует.");
+        }
+        TopAcademySource provisional = new TopAcademySource(savedToken, jsonMapper.createObjectNode());
+        JsonNode info = provisional.get("/settings/user-info", null);
+        if (info.has("data") && info.get("data").isObject()) info = info.get("data");
+        return new TopAcademySource(savedToken, info);
+    }
+
+    /** Только для безопасного хранения в Android Keystore. */
+    public String sessionToken() { return token; }
+
     @Override public Profile profile() { return profile; }
     @Override public void refresh() { synchronized (cache) { cache.clear(); } }
 
@@ -310,7 +324,16 @@ public final class TopAcademySource implements JournalSource {
             String was = text(pick(visit, "status_was"));
             boolean visited = "1".equals(was) || "2".equals(was) || "true".equalsIgnoreCase(was);
             if (visited) total[0]++;
-            if (date != null) entries.add(new AttendanceEntry(date, subject, visited));
+            // The source does not document the semantic difference between 1 and 2.
+            // Only an explicit lateness indicator is interpreted as 'late'.
+            String lateFlag = text(pick(visit, "is_late", "late", "was_late"));
+            String lateMinutes = text(pick(visit, "late_minutes", "minutes_late"));
+            boolean late = visited && ("true".equalsIgnoreCase(lateFlag)
+                || "1".equals(lateFlag)
+                || (lateMinutes.matches("[0-9]{1,4}") && Integer.parseInt(lateMinutes) > 0));
+            AttendanceState state = visited ? (late ? AttendanceState.late : AttendanceState.present)
+                : ("0".equals(was) || "false".equalsIgnoreCase(was) ? AttendanceState.absent : AttendanceState.unknown);
+            if (date != null) entries.add(new AttendanceEntry(date, subject, visited, state, was, visitId));
             for (String[] f : marks) {
                 Integer mark = parseMark(text(pick(visit, f[0])));
                 if (mark == null || mark <= 0) continue;

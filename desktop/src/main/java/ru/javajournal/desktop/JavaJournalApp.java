@@ -5,12 +5,14 @@ import javafx.application.Platform;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Node;
+import javafx.scene.CacheHint;
 import javafx.scene.Scene;
 import javafx.scene.control.*;
 import javafx.scene.layout.*;
 import javafx.scene.paint.Color;
 import javafx.scene.shape.Circle;
 import javafx.scene.image.Image;
+import javafx.scene.image.ImageView;
 import javafx.stage.Stage;
 import javafx.stage.FileChooser;
 import javafx.stage.DirectoryChooser;
@@ -28,10 +30,12 @@ import ru.javajournal.core.model.*;
 import ru.javajournal.core.service.JournalSource;
 import ru.javajournal.core.service.JournalFilters;
 import ru.javajournal.core.service.JournalDisplay;
+import ru.javajournal.core.service.JournalCalendar;
 import ru.javajournal.core.service.ReleaseUpdates;
 import javafx.beans.binding.Bindings;
 
 import java.time.LocalDate;
+import java.time.YearMonth;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.TextStyle;
@@ -51,7 +55,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Desktop GUI не блокирует JavaFX Thread во время сетевых операций.
  */
 public final class JavaJournalApp extends Application {
-    private enum Page { overview, schedule, homework, grades, attendance, profile }
+    private enum Page { overview, schedule, homework, grades, attendance, calendar, profile }
     private record Palette(String bg, String surface, String raised, String border,
                            String text, String muted, String accent, String accentDim,
                            String green, String greenDim, String amber, String amberDim,
@@ -81,6 +85,7 @@ public final class JavaJournalApp extends Application {
     private JournalFilters.HomeworkSort homeworkSort = JournalFilters.HomeworkSort.dueAscending;
     private JournalFilters.Period statsPeriod = JournalFilters.Period.month;
     private LocalDate statsDate = LocalDate.now();
+    private YearMonth calendarMonth = YearMonth.now();
     private boolean checkingUpdates = false;
     private boolean updateNoticeShown = false;
 
@@ -110,7 +115,9 @@ public final class JavaJournalApp extends Application {
 
     private Label text(String value, double size, boolean bold, String color) {
         Label label = new Label(value == null ? "" : value);
-        label.setWrapText(true);
+        // Не запускаем расчёт переноса строк для сотен коротких меток в расписании.
+        // Длинные заголовки и описания сохраняют автоматический перенос.
+        label.setWrapText(value != null && (value.length() > 40 || value.contains("\n")));
         label.setStyle("-fx-text-fill: " + color + "; -fx-font-size: " + size + "px; -fx-font-weight: "
             + (bold ? "700" : "400") + "; -fx-font-family: 'Segoe UI', 'Arial';");
         return label;
@@ -242,9 +249,18 @@ public final class JavaJournalApp extends Application {
         icon.setPrefSize(size, size);
         icon.setMinSize(size, size);
         icon.setMaxSize(size, size);
-        icon.setStyle("-fx-background-color: #6778F8; -fx-background-radius: " + (size / 4) + ";");
-        Label j = text("J", size * 0.54, true, "#FFFFFF");
-        icon.getChildren().add(j);
+        var logoUrl = JavaJournalApp.class.getResource("/icons/javajournal.png");
+        if (logoUrl != null) {
+            ImageView picture = new ImageView(new Image(logoUrl.toExternalForm()));
+            picture.setFitWidth(size);
+            picture.setFitHeight(size);
+            picture.setPreserveRatio(true);
+            picture.setSmooth(true);
+            icon.getChildren().add(picture);
+        } else {
+            icon.setStyle("-fx-background-color: #6778F8; -fx-background-radius: " + (size / 4) + ";");
+            icon.getChildren().add(text("J", size * 0.54, true, "#FFFFFF"));
+        }
         return icon;
     }
 
@@ -332,11 +348,12 @@ public final class JavaJournalApp extends Application {
         Label navTitle = muted("РАЗДЕЛЫ", 10);
         navTitle.setPadding(new Insets(0, 0, 10, 13));
         panel.getChildren().add(navTitle);
-        addMenu(panel, "Обзор", Page.overview);
+        addMenu(panel, "Главная", Page.overview);
         addMenu(panel, "Расписание", Page.schedule);
         addMenu(panel, "Домашние задания", Page.homework);
         addMenu(panel, "Оценки", Page.grades);
         addMenu(panel, "Посещаемость", Page.attendance);
+        addMenu(panel, "Календарь", Page.calendar);
         addMenu(panel, "Профиль", Page.profile);
         Region vSpacer = new Region();
         VBox.setVgrow(vSpacer, Priority.ALWAYS);
@@ -411,6 +428,7 @@ public final class JavaJournalApp extends Application {
             case homework -> "Домашние задания";
             case grades -> "Оценки";
             case attendance -> "Посещаемость";
+            case calendar -> "Календарь";
             case profile -> "Мой профиль";
         };
         out.add(title(heading, 28));
@@ -436,6 +454,7 @@ public final class JavaJournalApp extends Application {
             case homework -> homework(out);
             case grades -> grades(out);
             case attendance -> attendance(out);
+            case calendar -> calendar(out);
             case profile -> profile(out);
         }
         return out;
@@ -602,6 +621,9 @@ public final class JavaJournalApp extends Application {
         box.setAlignment(Pos.CENTER_LEFT);
         box.setPadding(new Insets(compact ? 12 : 14, 12, compact ? 12 : 14, 12));
         box.setStyle(boxStyle(p.raised, 12, false));
+        // Статичные строки расписания кешируем как изображения при прокрутке.
+        box.setCache(true);
+        box.setCacheHint(CacheHint.SPEED);
         VBox time = column(3, text(blank(lesson.start(), "—"), 15, true, p.accent),
             muted(blank(lesson.end(), ""), 11));
         time.setPrefWidth(61);
@@ -782,6 +804,8 @@ public final class JavaJournalApp extends Application {
         VBox card = column(tile ? 9 : 11);
         card.setPadding(new Insets(tile ? 15 : 16));
         card.setStyle(boxStyle(palette.raised, 12, false));
+        card.setCache(true);
+        card.setCacheHint(CacheHint.SPEED);
         if (showSubject) {
             HBox heading = row(9, pill(homework.subject(), palette.accent, palette.accentDim), spacer());
             heading.setAlignment(Pos.CENTER_LEFT);
@@ -1198,6 +1222,99 @@ public final class JavaJournalApp extends Application {
             box.getChildren().add(item);
         }
         out.add(box);
+    }
+
+    /** Desktop calendar uses the same JournalCalendar projection as Android. */
+    private void calendar(List<Node> out) {
+        Palette p = palette();
+        HBox controls = row(12);
+        controls.setAlignment(Pos.CENTER_LEFT);
+        controls.getChildren().add(subtle("‹", () -> { calendarMonth = calendarMonth.minusMonths(1); drawApp(); }));
+        Label month = title(capitalize(calendarMonth.getMonth().getDisplayName(TextStyle.FULL_STANDALONE, russianLocale))
+            + " " + calendarMonth.getYear(), 19);
+        month.setMinWidth(220);
+        month.setAlignment(Pos.CENTER);
+        controls.getChildren().add(month);
+        controls.getChildren().add(subtle("›", () -> { calendarMonth = calendarMonth.plusMonths(1); drawApp(); }));
+        controls.getChildren().add(subtle("Сегодня", () -> { calendarMonth = YearMonth.now(); drawApp(); }));
+        out.add(controls);
+        HBox legend = row(18,
+            pill("● Присутствовал", p.green, p.greenDim),
+            pill("● Опоздал", p.amber, p.amberDim),
+            pill("● Отсутствовал", p.red, p.redDim));
+        out.add(legend);
+        VBox panel = card(13);
+        GridPane grid = new GridPane();
+        grid.setHgap(7);
+        grid.setVgap(7);
+        for (int i=0;i<7;i++) {
+            ColumnConstraints constraint = new ColumnConstraints();
+            constraint.setPercentWidth(100.0/7);
+            grid.getColumnConstraints().add(constraint);
+        }
+        String[] weekdays = {"Пн","Вт","Ср","Чт","Пт","Сб","Вс"};
+        for(int i=0;i<7;i++) {
+            Label day = muted(weekdays[i], 12);
+            day.setMaxWidth(Double.MAX_VALUE);
+            day.setAlignment(Pos.CENTER);
+            grid.add(day,i,0);
+        }
+        int offset = calendarMonth.atDay(1).getDayOfWeek().getValue()-1;
+        for (JournalCalendar.Day day : JournalCalendar.forMonth(data, calendarMonth)) {
+            int pos = offset + day.date().getDayOfMonth()-1;
+            VBox tile = column(9);
+            tile.setPadding(new Insets(12));
+            tile.setMinHeight(85);
+            tile.setMaxWidth(Double.MAX_VALUE);
+            boolean today = day.date().equals(LocalDate.now());
+            tile.setStyle(boxStyle(today?p.accentDim:p.raised, 11, true)+"-fx-cursor: hand;");
+            Label number = title(String.valueOf(day.date().getDayOfMonth()), 15);
+            HBox dots = row(5);
+            if(day.hasAttendance(AttendanceState.present)) dots.getChildren().add(marker(p.green,4));
+            if(day.hasAttendance(AttendanceState.late)) dots.getChildren().add(marker(p.amber,4));
+            if(day.hasAttendance(AttendanceState.absent)) dots.getChildren().add(marker(p.red,4));
+            if(day.hasGrades()) dots.getChildren().add(marker(p.accent,4));
+            tile.getChildren().addAll(number,dots);
+            tile.setOnMouseClicked(event -> showCalendarDay(day));
+            grid.add(tile,pos%7,pos/7+1);
+        }
+        panel.getChildren().add(grid);
+        out.add(panel);
+        out.add(muted("Выбери день, чтобы увидеть занятия, посещаемость и оценки по видам работ.", 12));
+    }
+
+    private void showCalendarDay(JournalCalendar.Day day) {
+        Dialog<Void> dialog = new Dialog<>();
+        dialog.initOwner(stage);
+        dialog.setTitle(day.date().format(fullDate));
+        dialog.getDialogPane().getButtonTypes().add(ButtonType.CLOSE);
+        VBox body = column(13);
+        body.setPadding(new Insets(16));
+        body.setPrefWidth(530);
+        body.getChildren().add(title(day.date().format(fullDate),20));
+        if(day.events().isEmpty())body.getChildren().add(muted("На эту дату записей нет.",14));
+        for(JournalCalendar.LessonEvent event:day.events()) {
+            VBox entry = column(7);
+            entry.setPadding(new Insets(14));
+            entry.setStyle(boxStyle(palette().raised,12,true));
+            entry.getChildren().add(title(event.subject(),16));
+            if(!event.time().isBlank())entry.getChildren().add(muted(event.time(),12));
+            String color = switch(event.attendance()) {
+                case present -> palette().green;
+                case late -> palette().amber;
+                case absent -> palette().red;
+                case unknown -> palette().muted;
+            };
+            entry.getChildren().add(text(event.attendance().label(),12,true,color));
+            for(Grade mark:event.grades())entry.getChildren().add(
+                text(mark.type()+": "+mark.value(),13,true,palette().accent));
+            body.getChildren().add(entry);
+        }
+        ScrollPane sc = new ScrollPane(body);
+        sc.setFitToWidth(true);
+        sc.setPrefViewportHeight(500);
+        dialog.getDialogPane().setContent(sc);
+        dialog.showAndWait();
     }
 
     private void profile(List<Node> out) {

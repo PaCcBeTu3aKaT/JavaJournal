@@ -11,7 +11,7 @@ if errorlevel 1 (
     echo ERROR: Java not found. Install JDK 21.
     goto :fail
 )
-call "%~dp0gradlew.bat" :core:test :desktop:packageWindows
+call "%~dp0gradlew.bat" clean :core:test :desktop:packageWindows
 if errorlevel 1 goto :fail
 echo.
 echo SUCCESS: desktop\build\distributions\

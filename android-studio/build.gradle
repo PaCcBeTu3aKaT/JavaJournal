@@ -1,0 +1,5 @@
+// Android Studio opens this root; core and android live next to android-studio.
+allprojects {
+    group = 'ru.javajournal'
+    version = '2.0.0'
+}

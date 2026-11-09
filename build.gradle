@@ -3,5 +3,5 @@ plugins {
 }
 allprojects {
     group = 'ru.javajournal'
-    version = '1.0.1'
+    version = providers.gradleProperty('journalVersion').get()
 }
