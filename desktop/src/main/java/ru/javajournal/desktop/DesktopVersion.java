@@ -14,16 +14,11 @@ final class DesktopVersion {
     private DesktopVersion() { }
 
     static String current() {
-        return build.getProperty("appVersion", "1.0.1");
+        return build.getProperty("appVersion", "версия не определена");
     }
 
     static String repository() {
-        return preferences.get("githubRepository", build.getProperty("githubRepository", "")).strip();
-    }
-
-    static void saveRepository(String value) {
-        String repo = ReleaseUpdates.normalizeRepository(value);
-        preferences.put("githubRepository", repo);
+        return "PaCcBeTu3aKaT/JavaJournal";
     }
 
     private static Properties readBuild() {

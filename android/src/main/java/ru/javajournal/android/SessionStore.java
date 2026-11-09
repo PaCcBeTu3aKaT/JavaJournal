@@ -45,7 +45,29 @@ final class SessionStore {
             Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
             cipher.init(Cipher.DECRYPT_MODE, key(), new GCMParameterSpec(128, Base64.decode(iv, Base64.NO_WRAP)));
             return new String(cipher.doFinal(Base64.decode(encrypted, Base64.NO_WRAP)), StandardCharsets.UTF_8);
-        } catch (Exception ignored) { clear(); return null; }
+        } catch (Exception ignored) {
+            preferences.edit().remove("token").remove("iv").apply();
+            return null;
+        }
     }
-    void clear() { preferences.edit().remove("token").remove("iv").apply(); }
+    void saveCredentials(String username,String password) throws Exception {
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.ENCRYPT_MODE,key());
+        // Separator is not allowed in the login identifier; password may contain any character.
+        byte[] value = (username+"\n"+password).getBytes(StandardCharsets.UTF_8);
+        preferences.edit().putString("loginData",Base64.encodeToString(cipher.doFinal(value),Base64.NO_WRAP))
+            .putString("loginIv",Base64.encodeToString(cipher.getIV(),Base64.NO_WRAP)).apply();
+    }
+    String[] loadCredentials(){
+        String encrypted=preferences.getString("loginData",null),iv=preferences.getString("loginIv",null);
+        if(encrypted==null||iv==null)return null;
+        try{
+            Cipher cipher=Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE,key(),new GCMParameterSpec(128,Base64.decode(iv,Base64.NO_WRAP)));
+            String combined=new String(cipher.doFinal(Base64.decode(encrypted,Base64.NO_WRAP)),StandardCharsets.UTF_8);
+            int split=combined.indexOf('\n');if(split<0)return null;
+            return new String[]{combined.substring(0,split),combined.substring(split+1)};
+        }catch(Exception ignored){return null;}
+    }
+    void clear() { preferences.edit().clear().apply(); }
 }

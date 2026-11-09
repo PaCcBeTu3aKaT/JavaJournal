@@ -48,4 +48,13 @@ class ReleaseUpdatesTest {
         var release = ReleaseUpdates.parseRelease(json, "owner/JavaJournal", "0.3.4", "Windows 11", "amd64");
         assertEquals("", release.downloadUrl());
     }
+    @Test void choosesAndroidApkInsteadOfZip() throws Exception {
+        String androidFixture = """
+            {"tag_name":"v3.0.1","draft":false,"prerelease":false,"assets":[
+            {"name":"JavaJournal-3.0.1-android.apk","browser_download_url":"https://github.com/owner/JavaJournal/releases/download/v3.0.1/android.apk"},
+            {"name":"JavaJournal-3.0.1-windows-portable.zip","browser_download_url":"https://github.com/owner/JavaJournal/releases/download/v3.0.1/windows.zip"}]}
+            """;
+        var release=ReleaseUpdates.parseRelease(androidFixture,"owner/JavaJournal","3.0.0","Android","arm64");
+        assertEquals("JavaJournal-3.0.1-android.apk",release.assetName());
+    }
 }

@@ -7,6 +7,8 @@ import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
+import okhttp3.MultipartBody;
+import ru.javajournal.core.service.WorkSubmission;
 import okhttp3.Response;
 import ru.javajournal.core.model.*;
 import ru.javajournal.core.service.JournalSource;
@@ -17,6 +19,7 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.charset.StandardCharsets;
 import java.net.URI;
 import ru.javajournal.core.service.AttachmentLinks;
 import java.time.LocalDate;
@@ -37,7 +40,7 @@ import java.util.regex.Pattern;
 /**
  * Перенос документированных в исходном JS-JOURNAL запросов к API TOP Academy.
  * ВАЖНО: API сторонний, совместимость не подтверждена реальной авторизацией.
- * Пароль не сохраняется, токен существует только в оперативной памяти.
+ * Passwords are handled by platform credential stores, never logged by this client.
  */
 public final class TopAcademySource implements JournalSource {
     private static final String baseUrl = "https://msapi.top-academy.ru/api/v2";
@@ -134,23 +137,34 @@ public final class TopAcademySource implements JournalSource {
         try { lessons = lessons(date, week); }
         catch (IOException e) { if (isAuth(e)) throw e; lessons = List.of(); warnings.put("schedule", e.getMessage()); }
         List<Homework> homework;
-        try { homework = homework(); }
+        try { homework = loadHomework(0); }
         catch (IOException e) { if (isAuth(e)) throw e; homework = List.of(); warnings.put("homework", e.getMessage()); }
         List<Grade> grades = new ArrayList<>();
         List<Attendance> attendance = new ArrayList<>();
         List<AttendanceEntry> attendanceEntries = new ArrayList<>();
         try { parseVisits(cachedGet("visits", "/progress/operations/student-visits", null), grades, attendance, attendanceEntries); }
         catch (IOException e) { if (isAuth(e)) throw e; warnings.put("grades", e.getMessage()); warnings.put("attendance", e.getMessage()); }
-        Set<String> added = new HashSet<>();
-        for (Grade grade : grades) added.add(grade.id());
-        for (Homework hw : homework) {
-            if (hw.grade() != null && hw.grade() > 0 && added.add("hw-" + hw.id())) {
-                grades.add(new Grade("hw-" + hw.id(), hw.subject(), hw.grade(),
-                    "Домашнее задание", hw.title(), hw.due()));
-            }
-        }
+        // Do not synthesize grades from homework: student-visits already contains
+        // home_work_mark and duplicate synthetic grades caused two entries for one mark.
         grades.sort(Comparator.comparing(Grade::date, Comparator.nullsLast(Comparator.reverseOrder())));
         return new JournalData(date, week, profile, lessons, homework, grades, attendance, attendanceEntries, warnings);
+    }
+
+    @Override public JournalData loadCalendarMonth(java.time.YearMonth month) throws IOException {
+        java.time.LocalDate start=month.atDay(1),end=month.atEndOfMonth();
+        List<Lesson> monthLessons=new ArrayList<>();
+        Map<String,String> warnings=new HashMap<>();
+        try {
+            parseLessons(cachedGet("month:"+month,"/schedule/operations/get-month",
+                Map.of("date_filter",start.toString())),start,end,monthLessons);
+            monthLessons.sort(Comparator.comparing(Lesson::date).thenComparing(Lesson::start));
+        } catch(IOException e){if(isAuth(e))throw e;warnings.put("schedule",e.getMessage());}
+        List<Grade> grades=new ArrayList<>();
+        List<Attendance> totals=new ArrayList<>();
+        List<AttendanceEntry> visits=new ArrayList<>();
+        try{parseVisits(cachedGet("visits","/progress/operations/student-visits",null),grades,totals,visits);}
+        catch(IOException e){if(isAuth(e))throw e;warnings.put("attendance",e.getMessage());}
+        return new JournalData(start,true,profile,monthLessons,List.of(),grades,totals,visits,warnings);
     }
 
     private List<Lesson> lessons(LocalDate date, boolean week) throws IOException {
@@ -197,9 +211,11 @@ public final class TopAcademySource implements JournalSource {
         }
     }
 
-    private List<Homework> homework() throws IOException {
+    @Override public List<Homework> loadHomework(int type) throws IOException {
+        if (type != 0 && type != 1) throw new IOException("Неизвестный тип работы.");
+        String key = "homework:models:" + type;
         synchronized (cache) {
-            Cached found = cache.get("homework:models");
+            Cached found = cache.get(key);
             if (found != null && System.currentTimeMillis() - found.at < cacheTtl) {
                 @SuppressWarnings("unchecked") List<Homework> value = (List<Homework>) found.value;
                 return value;
@@ -208,11 +224,12 @@ public final class TopAcademySource implements JournalSource {
         if (groupId.isBlank()) throw new IOException("Не удалось определить учебную группу.");
         List<Homework> result = new ArrayList<>();
         Set<String> seen = new HashSet<>();
-        for (Integer status : new Integer[] {3, 2, 0, 1}) {
-            for (int page = 1; page <= 3; page++) {
+        for (int status : new int[]{3, 2, 0, 1, 5}) {
+            for (int page = 1; page <= 100; page++) {
                 JsonNode root;
                 try {
-                    root = get("/homework/operations/list", Map.of("page", page, "status", status, "group_id", groupId));
+                    root = get("/homework/operations/list", Map.of(
+                        "page", page, "status", status, "type", type, "group_id", groupId));
                 } catch (IOException e) {
                     if (isAuth(e)) throw e;
                     if (page == 1 && result.isEmpty()) continue;
@@ -224,32 +241,24 @@ public final class TopAcademySource implements JournalSource {
                 for (JsonNode item : items) {
                     String id = textOr(pick(item, "id"), "hw-" + result.size());
                     if (!seen.add(id)) continue;
-                    result.add(parseHomework(item, status, id));
+                    result.add(parseHomework(item, status, id, type));
                     added++;
                 }
                 if (added == 0) break;
             }
         }
-        // Фолбэк для API, который не поддерживает фильтрацию status.
-        if (result.isEmpty()) {
-            for (int page = 1; page <= 3; page++) {
-                JsonNode root = get("/homework/operations/list", Map.of("page", page, "group_id", groupId));
-                List<JsonNode> items = extractList(root, "homework_list", "homework", "items", "tasks");
-                if (items.isEmpty()) break;
-                for (JsonNode item : items) {
-                    String id = textOr(pick(item, "id"), "hw-" + result.size());
-                    if (seen.add(id)) result.add(parseHomework(item, 3, id));
-                }
-            }
-        }
         result.sort(Comparator.comparingInt(h -> switch (h.status()) {
             case pending -> 0; case overdue -> 1; case review -> 2; case done -> 3; case deleted -> 4;
         }));
-        synchronized (cache) { cache.put("homework:models", new Cached(System.currentTimeMillis(), List.copyOf(result))); }
-        return result;
+        List<Homework> snapshot = List.copyOf(result);
+        synchronized (cache) { cache.put(key, new Cached(System.currentTimeMillis(), snapshot)); }
+        return snapshot;
     }
 
     static Homework parseHomework(JsonNode node, int requestedStatus, String id) {
+        return parseHomework(node, requestedStatus, id, 0);
+    }
+    static Homework parseHomework(JsonNode node, int requestedStatus, String id, int workType) {
         JsonNode stud = pick(node, "homework_stud");
         String markStr = text(pick(stud, "mark", "grade", "auto_mark"));
         if (markStr.isBlank()) markStr = text(pick(node, "mark", "grade"));
@@ -264,7 +273,7 @@ public final class TopAcademySource implements JournalSource {
         if (st == 5 || statusName.contains("удал")) status = HomeworkStatus.deleted;
         else if (st == 1 || mark != null || statusName.contains("проверен")) status = HomeworkStatus.done;
         else if (st == 2 || statusName.contains("проверк")) status = HomeworkStatus.review;
-        else if (st == 0 || statusName.contains("просроч") || (due != null && due.isBefore(LocalDate.now()))) status = HomeworkStatus.overdue;
+        else if (st == 0 || statusName.contains("просроч")) status = HomeworkStatus.overdue;
         else status = HomeworkStatus.pending;
         String subject = textOr(pick(node, "name_spec", "spec_name", "subject_name"), "Предмет не указан");
         String title = textOr(pick(node, "theme", "name", "title"), "Домашнее задание");
@@ -284,9 +293,53 @@ public final class TopAcademySource implements JournalSource {
         if (studentName.isBlank() && studentAttachment.isObject()) {
             studentName = text(pick(studentAttachment, "file_name", "filename", "original_filename", "original_name", "name"));
         }
-        String studentAnswer = text(pick(stud, "text_answer", "answer_text", "answer", "text", "comment", "homework_text"));
+        String studentAnswer = text(pick(stud, "stud_answer", "text_answer", "answer_text", "answer", "text", "comment", "homework_text"));
         return new Homework(id, subject, title, desc, due, teacher, status, mark,
-            teacherComment, teacherFile, studentFile, teacherName, studentName, studentAnswer);
+            teacherComment, teacherFile, studentFile, teacherName, studentName, studentAnswer, workType);
+    }
+
+    /** Never run on the UI thread. First creates the homework, then saves feedback.
+     * A review failure returns a PARTIAL success, so the caller must never resend create.
+     */
+    @Override public WorkSubmission.Result submitWork(WorkSubmission.Form form) throws IOException {
+        return submitWork(form,java.nio.file.Paths.get(System.getProperty("java.io.tmpdir")));
+    }
+    @Override public WorkSubmission.Result submitWork(WorkSubmission.Form form, Path workDirectory) throws IOException {
+        try (WorkSubmission.Prepared prepared = WorkSubmission.prepare(form,workDirectory)) {
+            MultipartBody.Builder body = new MultipartBody.Builder().setType(MultipartBody.FORM)
+                .addFormDataPart("id", form.homeworkId())
+                .addFormDataPart("answerText", form.answer())
+                .addFormDataPart("spentTimeHour", String.valueOf(form.hours()))
+                .addFormDataPart("spentTimeMin", String.valueOf(form.minutes()));
+            if (prepared.path() != null) body.addFormDataPart("file", prepared.filename(),
+                RequestBody.create(prepared.path().toFile(), MediaType.parse("application/octet-stream")));
+            Request req = baseRequest(baseUrl + "/homework/operations/create")
+                .header("Authorization", "Bearer " + token).post(body.build()).build();
+            JsonNode created = execute(http, req);
+            String submissionId = text(pick(created, "id"));
+            if (submissionId.isBlank()) throw new IOException("Сервер не подтвердил ID отправленной работы. Проверь статус в журнале перед повтором.");
+            refresh();
+            ObjectNode evaluation = jsonMapper.createObjectNode();
+            evaluation.putNull("id");
+            evaluation.put("idDomZad", Integer.parseInt(form.homeworkId()));
+            evaluation.putNull("idStud");
+            evaluation.put("mark", form.rating());
+            evaluation.put("comment", form.comment());
+            var tags = evaluation.putArray("tags");
+            form.tags().forEach(tags::add);
+            MultipartBody reviewBody = new MultipartBody.Builder().setType(MultipartBody.FORM)
+                .addFormDataPart("EvaluationHomeworkForm", evaluation.toString()).build();
+            try {
+                Request review = baseRequest(baseUrl + "/homework/evaluation/operations/save")
+                    .header("Authorization", "Bearer " + token).post(reviewBody).build();
+                execute(http, review);
+                return new WorkSubmission.Result(submissionId, true, "Работа и отзыв отправлены.");
+            } catch (IOException failure) {
+                return new WorkSubmission.Result(submissionId, false,
+                    "Работа принята сервером (ID " + submissionId + "), но отзыв не сохранился: " + failure.getMessage()
+                    + ". Не отправляй работу повторно.");
+            }
+        }
     }
 
     private static String fileLink(JsonNode node) {

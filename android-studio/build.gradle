@@ -1,5 +1,17 @@
 // Android Studio opens this root; core and android live next to android-studio.
+// Keep ONE version source for Windows, macOS, Android and GitHub release assets.
+def sharedGradleProperties = new Properties()
+def sharedGradleFile = file('../gradle.properties')
+if (!sharedGradleFile.isFile()) {
+    throw new GradleException('Missing ../gradle.properties (shared JavaJournal version).')
+}
+sharedGradleFile.withInputStream { sharedGradleProperties.load(it) }
+def journalVersion = sharedGradleProperties.getProperty('journalVersion')
+if (!journalVersion || !(journalVersion ==~ /\d+\.\d+\.\d+/)) {
+    throw new GradleException('Invalid journalVersion in ../gradle.properties')
+}
 allprojects {
     group = 'ru.javajournal'
-    version = '2.0.0'
+    version = journalVersion
 }
+

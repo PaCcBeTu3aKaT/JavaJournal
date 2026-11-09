@@ -27,6 +27,8 @@ import ru.javajournal.core.model.*;
 import ru.javajournal.core.service.JournalCalendar;
 import ru.javajournal.core.service.JournalDisplay;
 import ru.javajournal.core.service.JournalFilters;
+import ru.javajournal.core.service.WorkSubmission;
+import ru.javajournal.core.service.ReleaseUpdates;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -63,8 +65,18 @@ public final class MainActivity extends Activity {
     private JournalData data;
     private String currentPage = "Главная";
     private Homework selectedHomework;
-    private Uri selectedUpload;
-    private String uploadFilename = "";
+    private final List<Uri> selectedUploads = new ArrayList<>();
+    private final List<String> uploadNames = new ArrayList<>();
+    private int taskType = 0;
+    private List<Homework> labs = List.of();
+    private boolean labsLoading = false;
+    private boolean submitting = false;
+    private boolean signingIn = false;
+    private boolean checkedUpdates = false;
+    private String timeHours = "0", timeMinutes = "30", reviewComment = "";
+    private int starRating = 0;
+    private final Set<Integer> chosenTags = new LinkedHashSet<>();
+    private JournalCalendar.Day openedCalendarDay;
     private String draftAnswer = "";
     private boolean dark = true;
     private boolean showWeek = true;
@@ -74,6 +86,9 @@ public final class MainActivity extends Activity {
     private int homeworkScroll = 0;
     private LocalDate selectedDate = JournalDisplay.startingWeekDate(LocalDate.now());
     private YearMonth calendarMonth = YearMonth.now();
+    private YearMonth loadedCalendarMonth;
+    private JournalData loadedCalendarData;
+    private boolean calendarLoading=false;
     private LocalDate calendarDay = LocalDate.now();
     private JournalFilters.Period period = JournalFilters.Period.month;
     private LocalDate periodDate = LocalDate.now();
@@ -84,6 +99,7 @@ public final class MainActivity extends Activity {
     private LinearLayout root;
     private LinearLayout content;
     private ScrollView pageScroll;
+    private ScrollView detailScroll;
     private View updateBanner;
     private boolean bannerDismissed;
 
@@ -93,19 +109,23 @@ public final class MainActivity extends Activity {
         getWindow().setNavigationBarColor(darkBackground);
         sessions = new SessionStore(this);
         String saved = sessions.load();
-        if (saved == null) { showLogin(null); return; }
-        // Restore session in a worker; show the shell without a full-screen splash.
-        fetching = true;
-        showPage();
-        beginBannerDelay();
-        work(() -> TopAcademySource.restoreSession(saved), restored -> {
-            source = restored;
-            loadData();
+        String[] credentials = sessions.loadCredentials();
+        if (saved == null && credentials == null) { showLogin(null); return; }
+        fetching = true; signingIn = true;
+        showPage(); beginBannerDelay();
+        work(() -> {
+            if (saved != null) try { return TopAcademySource.restoreSession(saved); }
+                catch (TopAcademySource.AuthException invalid) { /* try saved credentials */ }
+            if (credentials == null) throw new TopAcademySource.AuthException("Нет сохранённых данных для входа.");
+            return TopAcademySource.login(credentials[0], credentials[1]);
+        }, restored -> {
+            source = restored;loadedCalendarMonth=null;
+            try { sessions.save(restored.sessionToken()); } catch (Exception ignored) { }
+            loadData(); checkUpdates(false);
         }, error -> {
-            finishFetch();
-            if (error instanceof TopAcademySource.AuthException) sessions.clear();
-            showLogin(error instanceof TopAcademySource.AuthException ?
-                "Сессия истекла. Войди снова." : "Не удалось восстановить сессию. Проверь интернет.");
+            finishFetch(); signingIn = false;
+            if (error instanceof TopAcademySource.AuthException) showLogin("Требуется повторный вход.");
+            else { showPage(); toast("Не удалось войти: " + safeError(error)); }
         });
     }
 
@@ -155,8 +175,19 @@ public final class MainActivity extends Activity {
     }
     private LinearLayout.LayoutParams weight(int height) { return new LinearLayout.LayoutParams(0,dp(height),1); }
     private void setupFrame(View page) {
+        // Preserve the same refresh/login banner across page redraws, instead of
+        // recreating it between restoreSession and the first data request.
+        View banner = updateBanner;
+        FrameLayout.LayoutParams bannerLayout = null;
+        if (banner != null && banner.getParent() instanceof ViewGroup parent) {
+            if (banner.getLayoutParams() instanceof FrameLayout.LayoutParams params)
+                bannerLayout = new FrameLayout.LayoutParams(params);
+            parent.removeView(banner);
+        }
         frame = new FrameLayout(this);frame.setBackgroundColor(background());
         frame.addView(page,new FrameLayout.LayoutParams(-1,-1));
+        if(banner != null)frame.addView(banner,bannerLayout==null?
+            new FrameLayout.LayoutParams(-2,-2,Gravity.TOP|Gravity.CENTER_HORIZONTAL):bannerLayout);
         setContentView(frame);
     }
     private EditText field(String hint,boolean password) {
@@ -189,8 +220,9 @@ public final class MainActivity extends Activity {
             if(username.isEmpty()||pass.isEmpty()){toast("Введи логин и пароль");return;}
             enter.setEnabled(false);progress.setVisibility(View.VISIBLE);
             work(()->TopAcademySource.login(username,pass),logged->{
-                source=logged;try{sessions.save(logged.sessionToken());}catch(Exception ex){toast("Не удалось сохранить сессию");}
-                loadData();
+                source=logged;try{sessions.save(logged.sessionToken());sessions.saveCredentials(username,pass);}
+                catch(Exception ex){toast("Не удалось сохранить данные входа");}
+                signingIn=false;loadData();checkUpdates(false);
             },error->{enter.setEnabled(true);progress.setVisibility(View.GONE);
                 toast("Ошибка входа: "+safeError(error));});
         });
@@ -221,7 +253,7 @@ public final class MainActivity extends Activity {
         capsule.setBackground(shape(dark?Color.rgb(48,67,92):Color.WHITE,35,true));
         ProgressBar progress=new ProgressBar(this);progress.setIndeterminateTintList(ColorStateList.valueOf(accent));
         capsule.addView(progress,new LinearLayout.LayoutParams(dp(19),dp(19)));
-        TextView t=label("Обновление...",13,true,primary());t.setPadding(dp(9),0,0,0);capsule.addView(t);
+        TextView t=label(signingIn?"Вход...":"Обновление...",13,true,primary());t.setPadding(dp(9),0,0,0);capsule.addView(t);
         FrameLayout.LayoutParams lp=new FrameLayout.LayoutParams(-2,-2,Gravity.TOP|Gravity.CENTER_HORIZONTAL);
         lp.topMargin=dp(9);frame.addView(capsule,lp);updateBanner=capsule;
         capsule.setTranslationY(-dp(75));capsule.setAlpha(0f);
@@ -242,7 +274,7 @@ public final class MainActivity extends Activity {
         banner.animate().alpha(0f).translationY(-dp(70)).setDuration(180)
             .withEndAction(()->{if(banner.getParent() instanceof ViewGroup p)p.removeView(banner);}).start();
     }
-    private void finishFetch() { fetching=false;requestSequence++;hideBanner(); }
+    private void finishFetch() { fetching=false;signingIn=false;requestSequence++;hideBanner(); }
     private void loadData() {
         if(source==null){showLogin(null);return;}
         fetching=true;requestSequence++;
@@ -252,26 +284,37 @@ public final class MainActivity extends Activity {
         work(()->source.load(selectedDate,showWeek),loaded->{
             if(sequence!=requestSequence)return;
             data=loaded;finishFetch();showPage();
+            if("Календарь".equals(currentPage) && openedCalendarDay==null)fetchCalendarMonth();
         },error->{
             if(sequence!=requestSequence)return;
             finishFetch();
-            if(error instanceof TopAcademySource.AuthException){sessions.clear();source=null;data=null;showLogin("Сессия истекла.");}
+            if(error instanceof TopAcademySource.AuthException){
+                String[] saved = sessions.loadCredentials();
+                if(saved == null){source=null;showLogin("Сессия истекла.");}
+                else {
+                    signingIn=true;fetching=true;beginBannerDelay();
+                    work(()->TopAcademySource.login(saved[0],saved[1]),logged->{
+                        source=logged;try{sessions.save(logged.sessionToken());}catch(Exception ignored){}
+                        loadData();
+                    },failed->{finishFetch();source=null;showLogin("Не удалось восстановить вход.");});
+                }
+            }
             else {showPage();toast("Не удалось обновить данные: "+safeError(error));}
         });
     }
-    private void refresh() {if(source!=null&&!fetching){source.refresh();loadData();}}
+    private void refresh() {if(source!=null&&!fetching){source.refresh();loadedCalendarMonth=null;loadData();}}
 
     private void showPage() {
         root=vertical();root.setBackgroundColor(background());
         LinearLayout top=horizontal();top.setPadding(dp(16),dp(14),dp(16),dp(14));
         top.setBackgroundColor(surface());
-        TextView title=label(currentPage,23,true,primary());top.addView(title,new LinearLayout.LayoutParams(0,-2,1));
+        TextView title=label(openedCalendarDay!=null?openedCalendarDay.date().format(dateFormat):currentPage,23,true,primary());top.addView(title,new LinearLayout.LayoutParams(0,-2,1));
         Button update=button("↻",this::refresh,false);
         top.addView(update,new LinearLayout.LayoutParams(dp(51),dp(45)));root.addView(top);
         pageScroll=new ScrollView(this);pageScroll.setFillViewport(true);
         root.addView(pageScroll,new LinearLayout.LayoutParams(-1,0,1));
         content=vertical();pad(content,16);pageScroll.addView(content);
-        if(data==null){
+        if(openedCalendarDay!=null){ showCalendarDayPage(openedCalendarDay); } else if(data==null){
             LinearLayout p=card();txt(p,"Загружаем данные",18,true);
             secondary(p,"Информация появится после подключения к журналу.");content.addView(p);
         } else switch(currentPage){
@@ -284,10 +327,8 @@ public final class MainActivity extends Activity {
             case "Настройки" -> settings();
             default -> profile();
         }
-        if(moreOpen)root.addView(morePanel());
-        root.addView(navigation());
+        if(openedCalendarDay==null){if(moreOpen)root.addView(morePanel());root.addView(navigation());}
         setupFrame(root);
-        if(fetching)beginBannerDelay();
         if("Задания".equals(currentPage)&&selectedHomework==null&&homeworkScroll>0){
             pageScroll.post(()->pageScroll.scrollTo(0,homeworkScroll));
         }
@@ -331,9 +372,10 @@ public final class MainActivity extends Activity {
         return panel;
     }
     private void navigate(String page) {
-        moreOpen=false;selectedHomework=null;currentPage=page;
+        moreOpen=false;selectedHomework=null;openedCalendarDay=null;currentPage=page;
         if(!"Задания".equals(page))homeworkScroll=0;
         showPage();
+        if("Календарь".equals(page))fetchCalendarMonth();
     }
     private void sectionTitle(LinearLayout parent,String title,Runnable action,String link) {
         LinearLayout row=horizontal();TextView t=label(title,18,true,primary());
@@ -383,13 +425,16 @@ public final class MainActivity extends Activity {
         View dot=new View(this);dot.setBackground(shape(color,10,false));headingRow.addView(dot,new LinearLayout.LayoutParams(dp(7),dp(7)));
         c.addView(headingRow);gap(c,9);c.addView(label(value,27,true,primary()));gap(c,6);
         c.addView(label(foot,11,false,muted()));c.setOnClickListener(v->click.run());
-        LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(0,dp(123),1);
-        lp.setMargins(dp(0),dp(0),dp(9),dp(10));row.addView(c,lp);
+        c.setMinimumHeight(dp(128));
+        LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(0,-2,1);
+        lp.setMargins(0,0,dp(9),dp(10));row.addView(c,lp);
     }
     private void switcher(LinearLayout parent,String left,String right,boolean leftActive,Runnable leftClick,Runnable rightClick) {
         LinearLayout row=horizontal();row.setBackground(shape(surface(),13,true));pad(row,3);
         Button a=button(left,leftClick,leftActive),b=button(right,rightClick,!leftActive);
-        row.addView(a,weight(46));row.addView(b,weight(46));parent.addView(row);gap(parent,15);
+        LinearLayout.LayoutParams leftParams=weight(42),rightParams=weight(42);
+        leftParams.rightMargin=dp(5);rightParams.leftMargin=dp(5);
+        row.addView(a,leftParams);row.addView(b,rightParams);parent.addView(row);gap(parent,15);
     }
     private void pager(LinearLayout parent,String date,Runnable previous,Runnable next,Runnable today) {
         LinearLayout row=horizontal();row.addView(button("‹",previous,false),new LinearLayout.LayoutParams(dp(48),dp(46)));
@@ -425,9 +470,13 @@ public final class MainActivity extends Activity {
     }
     private void shiftSchedule(int dir) {selectedDate=selectedDate.plusDays(showWeek?7L*dir:dir);loadData();}
     private void homework() {
+        switcher(content,"Домашние","Лабораторные",taskType==0,
+            ()->{taskType=0;homeworkScroll=0;showPage();},
+            ()->{taskType=1;homeworkScroll=0;showPage();loadLabs(false);});
+        if(taskType==1 && labsLoading)secondary(content,"Загружаем лабораторные работы...");
         HorizontalScrollView sc=new HorizontalScrollView(this);sc.setHorizontalScrollBarEnabled(false);
-        LinearLayout items=horizontal();String[] titles={"Все","Активно","Просрочено","На проверке","Проверено"};
-        HomeworkStatus[] states={null,HomeworkStatus.pending,HomeworkStatus.overdue,HomeworkStatus.review,HomeworkStatus.done};
+        LinearLayout items=horizontal();String[] titles={"Все","Активно","Просрочено","На проверке","Проверено","Удалено"};
+        HomeworkStatus[] states={null,HomeworkStatus.pending,HomeworkStatus.overdue,HomeworkStatus.review,HomeworkStatus.done,HomeworkStatus.deleted};
         for(int i=0;i<titles.length;i++){
             HomeworkStatus filter=states[i];Button btn=button(titles[i],()->{homeworkFilter=filter;homeworkScroll=0;showPage();},
                 Objects.equals(homeworkFilter,filter));
@@ -444,7 +493,7 @@ public final class MainActivity extends Activity {
                 if(wanted!=homeworkSort){homeworkSort=wanted;homeworkScroll=0;showPage();}
             }
         });content.addView(sort,new LinearLayout.LayoutParams(-1,dp(45)));gap(content,12);
-        List<Homework> chosen=data.homework().stream().filter(h->homeworkFilter==null||h.status()==homeworkFilter).collect(Collectors.toList());
+        List<Homework> chosen=(taskType==0?data.homework():labs).stream().filter(h->homeworkFilter==null||h.status()==homeworkFilter).collect(Collectors.toList());
         Map<HomeworkStatus,List<Homework>> groups=JournalFilters.groupedHomework(chosen,homeworkSort);
         if(groups.isEmpty())secondary(content,"Заданий нет");
         for(Map.Entry<HomeworkStatus,List<Homework>> group:groups.entrySet()){
@@ -462,6 +511,7 @@ public final class MainActivity extends Activity {
         TextView subject=label(h.subject(),12,true,cyan);row.addView(subject,new LinearLayout.LayoutParams(0,-2,1));
         row.addView(label(h.status().label(),11,true,statusColor(h.status())));
         p.addView(row);gap(p,9);txt(p,h.title(),16,true);
+        if(h.grade()!=null)txt(p,"Оценка: "+h.grade(),14,true);
         secondary(p,"Сдать: "+(h.due()==null?"—":h.due().format(dateFormat)));
         p.setOnClickListener(v->openHomework(h));content.addView(p);
     }
@@ -470,11 +520,12 @@ public final class MainActivity extends Activity {
     };}
     private void openHomework(Homework h) {
         if(pageScroll!=null&&"Задания".equals(currentPage))homeworkScroll=pageScroll.getScrollY();
-        selectedHomework=h;selectedUpload=null;uploadFilename="";draftAnswer="";moreOpen=false;
+        selectedHomework=h;detailScroll=null;selectedUploads.clear();uploadNames.clear();draftAnswer="";reviewComment="";timeHours="0";timeMinutes="30";starRating=0;chosenTags.clear();moreOpen=false;
         showHomeworkDetail();
     }
     private void showHomeworkDetail() {
         Homework h=selectedHomework;if(h==null){showPage();return;}
+        int previousScroll=detailScroll==null?0:detailScroll.getScrollY();
         root=vertical();root.setBackgroundColor(background());
         LinearLayout header=horizontal();header.setPadding(dp(12),dp(12),dp(16),dp(12));header.setBackgroundColor(surface());
         Button back=button("‹",this::closeHomework,false);header.addView(back,new LinearLayout.LayoutParams(dp(48),dp(48)));
@@ -482,6 +533,7 @@ public final class MainActivity extends Activity {
         heading.addView(label(h.title(),17,true,primary()));heading.addView(label(h.subject(),12,false,muted()));
         header.addView(heading,new LinearLayout.LayoutParams(0,-2,1));root.addView(header);
         ScrollView sc=new ScrollView(this);root.addView(sc,new LinearLayout.LayoutParams(-1,0,1));
+        detailScroll=sc;
         LinearLayout body=vertical();pad(body,16);sc.addView(body);
         LinearLayout description=card();
         secondary(description,"Сдать: "+(h.due()==null?"—":h.due().format(dateFormat)));
@@ -508,14 +560,53 @@ public final class MainActivity extends Activity {
                 @Override public void afterTextChanged(Editable e){}
             });
             answer.addView(text);gap(answer,12);
-            Button file=button(uploadFilename.isBlank()?"Выбрать файл":uploadFilename,
-                ()->{Intent intent=new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                    intent.addCategory(Intent.CATEGORY_OPENABLE);intent.setType("*/*");
-                    startActivityForResult(intent,chooseUploadRequest);},false);
-            answer.addView(file,new LinearLayout.LayoutParams(-1,dp(48)));gap(answer,12);
-            TextView status=label("Отправка станет доступна после подтверждения API.",12,false,muted());answer.addView(status);
-            Button send=button("Отправить на проверку",null,true);send.setEnabled(false);
-            answer.addView(send,new LinearLayout.LayoutParams(-1,dp(48)));body.addView(answer);
+            for(int idx=0;idx<selectedUploads.size();idx++){
+                int removeAt=idx;
+                LinearLayout fileRow=horizontal();
+                fileRow.addView(label(uploadNames.get(idx),12,false,primary()),new LinearLayout.LayoutParams(0,-2,1));
+                fileRow.addView(button("×",()->{selectedUploads.remove(removeAt);uploadNames.remove(removeAt);showHomeworkDetail();},false),
+                    new LinearLayout.LayoutParams(dp(44),dp(42)));
+                answer.addView(fileRow);
+            }
+            Button file=button("Добавить файлы",()->{
+                Intent intent=new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);intent.setType("*/*");
+                intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE,true);
+                startActivityForResult(intent,chooseUploadRequest);
+            },false);
+            answer.addView(file,new LinearLayout.LayoutParams(-1,dp(48)));
+            if(selectedUploads.size()>1)secondary(answer,"При отправке файлы автоматически объединятся в ZIP.");
+            gap(answer,12);
+            txt(answer,"Время выполнения",14,true);
+            LinearLayout timing=horizontal();
+            EditText hours=field("Часы",false), minutes=field("Минуты",false);
+            hours.setInputType(InputType.TYPE_CLASS_NUMBER);minutes.setInputType(InputType.TYPE_CLASS_NUMBER);
+            hours.setText(timeHours);minutes.setText(timeMinutes);
+            hours.addTextChangedListener(watch(value->timeHours=value));
+            minutes.addTextChangedListener(watch(value->timeMinutes=value));
+            timing.addView(hours,weight(50));timing.addView(minutes,weight(50));answer.addView(timing);gap(answer,12);
+            txt(answer,"Оценка задания",14,true);
+            LinearLayout stars=horizontal();stars.setGravity(Gravity.CENTER);
+            for(int i=1;i<=5;i++){
+                int star=i;Button b=button(i<=starRating?"★":"☆",()->{starRating=star;showHomeworkDetail();},false);
+                stars.addView(b,weight(46));
+            }
+            answer.addView(stars);gap(answer,10);
+            String[] tagNames={"Всё круто!","Всё понятно!","Скучно :(","Задание слишком сложное",
+                "Мне нравится","Не понятно, но нужно было сделать","Задание слишком простое"};
+            txt(answer,"Впечатления",14,true);
+            for(int i=0;i<tagNames.length;i++){
+                int id=i+1;Button tag=button((chosenTags.contains(id)?"✓ ":"")+tagNames[i],()->{
+                    if(!chosenTags.add(id))chosenTags.remove(id);showHomeworkDetail();
+                },chosenTags.contains(id));answer.addView(tag,new LinearLayout.LayoutParams(-1,dp(42)));
+            }
+            gap(answer,10);
+            EditText comment=field("Комментарий (необязательно)",false);
+            comment.setSingleLine(false);comment.setMinLines(2);comment.setText(reviewComment);
+            comment.addTextChangedListener(watch(value->reviewComment=value));answer.addView(comment);gap(answer,14);
+            Button send=button(submitting?"Отправляем...":"Отправить работу",()->submitHomework(h),true);
+            send.setEnabled(!submitting);
+            answer.addView(send,new LinearLayout.LayoutParams(-1,dp(49)));body.addView(answer);
         }else{
             LinearLayout sent=card();txt(sent,"Моя отправленная работа",17,true);gap(sent,10);
             if(h.studentFileUrl()!=null&&!h.studentFileUrl().isBlank()){
@@ -529,11 +620,50 @@ public final class MainActivity extends Activity {
             secondary(sent,"Операция ожидает подтверждения API.");body.addView(sent);
         }
         gap(body,24);setupFrame(root);
+        sc.post(()->sc.scrollTo(0,previousScroll));
+    }
+    private TextWatcher watch(java.util.function.Consumer<String> consumer){
+        return new TextWatcher(){
+            public void beforeTextChanged(CharSequence s,int start,int count,int after){}
+            public void onTextChanged(CharSequence s,int start,int before,int count){consumer.accept(s.toString());}
+            public void afterTextChanged(Editable e){}
+        };
+    }
+    private void submitHomework(Homework h){
+        if(submitting)return;
+        try {
+            List<WorkSubmission.Attachment> files=new ArrayList<>();
+            for(int i=0;i<selectedUploads.size();i++){
+                Uri uri=selectedUploads.get(i);String name=uploadNames.get(i);
+                files.add(new WorkSubmission.Attachment(name,()->{
+                    java.io.InputStream in=getContentResolver().openInputStream(uri);
+                    if(in==null)throw new java.io.IOException("Файл недоступен: "+name);return in;
+                }));
+            }
+            int hours=Integer.parseInt(timeHours),minutes=Integer.parseInt(timeMinutes);
+            WorkSubmission.Form form=new WorkSubmission.Form(h.id(),h.workType(),files,draftAnswer,
+                hours,minutes,starRating,new ArrayList<>(chosenTags),reviewComment);
+            submitting=true;showHomeworkDetail();
+            work(()->source.submitWork(form,getCacheDir().toPath()),result->{
+                submitting=false;selectedHomework=null;detailScroll=null;selectedUploads.clear();uploadNames.clear();
+                toast(result.message());
+                if(taskType==1)loadLabs(true);
+                source.refresh();loadData();
+            },error->{submitting=false;toast("Не удалось отправить: "+safeError(error));showHomeworkDetail();});
+        }catch(Exception ex){toast("Проверь форму: "+safeError(ex));}
+    }
+    private void loadLabs(boolean force){
+        if(source==null||labsLoading)return;
+        labsLoading=true;
+        work(()->{if(force)source.refresh();return source.loadHomework(1);},result->{
+            labs=result;labsLoading=false;if("Задания".equals(currentPage))showPage();
+        },error->{labsLoading=false;toast("Лабораторные: "+safeError(error));});
     }
     private String fileTitle(String value){return value==null||value.isBlank()?"Вложение":value;}
-    private void closeHomework(){selectedHomework=null;selectedUpload=null;uploadFilename="";draftAnswer="";showPage();}
+    private void closeHomework(){if(submitting){toast("Идёт отправка работы");return;}selectedHomework=null;detailScroll=null;selectedUploads.clear();uploadNames.clear();draftAnswer="";showPage();}
     @Override public void onBackPressed() {
         if(selectedHomework!=null){closeHomework();return;}
+        if(openedCalendarDay!=null){openedCalendarDay=null;showPage();return;}
         if(moreOpen){moreOpen=false;showPage();return;}
         if(!"Главная".equals(currentPage)){navigate("Главная");return;}
         super.onBackPressed();
@@ -550,17 +680,17 @@ public final class MainActivity extends Activity {
     }
     @Override protected void onActivityResult(int request,int result,Intent response) {
         super.onActivityResult(request,result,response);
-        if(result!=RESULT_OK||response==null||response.getData()==null)return;
+        if(result!=RESULT_OK||response==null)return;
         Uri uri=response.getData();
         if(request==chooseUploadRequest){
-            selectedUpload=uri;
-            uploadFilename="Файл выбран";
-            try(android.database.Cursor c=getContentResolver().query(uri,null,null,null,null)){
-                if(c!=null&&c.moveToFirst()){
-                    int col=c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
-                    if(col>=0)uploadFilename=c.getString(col);
-                }
-            }catch(Exception ignored){}
+            List<Uri> picks=new ArrayList<>();
+            if(response.getClipData()!=null){
+                for(int i=0;i<response.getClipData().getItemCount();i++)picks.add(response.getClipData().getItemAt(i).getUri());
+            } else if(uri!=null)picks.add(uri);
+            for(Uri item:picks){
+                if(selectedUploads.contains(item))continue;
+                selectedUploads.add(item);uploadNames.add(resolveUploadName(item));
+            }
             showHomeworkDetail();
         }else if(request==saveDocumentRequest&&downloadedFile!=null){
             Path path=downloadedFile;
@@ -569,6 +699,15 @@ public final class MainActivity extends Activity {
             }finally{Files.deleteIfExists(path);}return true;},ok->{downloadedFile=null;toast("Файл сохранён");},
                 error->toast("Ошибка сохранения: "+safeError(error)));
         }
+    }
+    private String resolveUploadName(Uri uri){
+        try(android.database.Cursor c=getContentResolver().query(uri,null,null,null,null)){
+            if(c!=null&&c.moveToFirst()){
+                int idx=c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                if(idx>=0&&!c.isNull(idx))return c.getString(idx);
+            }
+        }catch(Exception ignored){}
+        return "вложение";
     }
     private void periodControls() {
         switcher(content,"Месяц","Учебный год",period==JournalFilters.Period.month,
@@ -602,17 +741,24 @@ public final class MainActivity extends Activity {
             LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,dp(6));lp.topMargin=dp(12);p.addView(bar,lp);content.addView(p);}
     }
     private void calendar() {
-        pager(content,calendarMonth.format(monthFormat),()->{calendarMonth=calendarMonth.minusMonths(1);calendarDay=calendarMonth.atDay(1);showPage();},
-            ()->{calendarMonth=calendarMonth.plusMonths(1);calendarDay=calendarMonth.atDay(1);showPage();},
-            ()->{calendarMonth=YearMonth.now();calendarDay=LocalDate.now();showPage();});
-        LinearLayout legend=horizontal();
-        legend.addView(label("● Был   ",11,false,green));
-        legend.addView(label("● Опоздал   ",11,false,amber));
-        legend.addView(label("● Пропустил",11,false,red));content.addView(legend);gap(content,14);
+        pager(content,calendarMonth.format(monthFormat),()->{calendarMonth=calendarMonth.minusMonths(1);calendarDay=calendarMonth.atDay(1);showPage();fetchCalendarMonth();},
+            ()->{calendarMonth=calendarMonth.plusMonths(1);calendarDay=calendarMonth.atDay(1);showPage();fetchCalendarMonth();},
+            ()->{calendarMonth=YearMonth.now();calendarDay=LocalDate.now();showPage();fetchCalendarMonth();});
+        if(!calendarMonth.equals(loadedCalendarMonth)){
+            secondary(content,"Загружаем занятия за выбранный месяц...");return;
+        }
+        LinearLayout legend=vertical();
+        LinearLayout first=horizontal(), second=horizontal();
+        first.addView(label("● Был    ",11,false,green));
+        first.addView(label("● Опоздал    ",11,false,amber));
+        first.addView(label("● Пропустил",11,false,red));
+        second.addView(label("● Предстоит    ",11,false,cyan));
+        second.addView(label("● Нет данных",11,false,muted()));
+        legend.addView(first);legend.addView(second);content.addView(legend);gap(content,14);
         LinearLayout month=card();String[] weekdays={"Пн","Вт","Ср","Чт","Пт","Сб","Вс"};
         LinearLayout header=horizontal();for(String d:weekdays){TextView t=label(d,11,true,muted());t.setGravity(Gravity.CENTER);
             header.addView(t,weight(30));}month.addView(header);
-        List<JournalCalendar.Day> days=JournalCalendar.forMonth(data,calendarMonth);
+        List<JournalCalendar.Day> days=JournalCalendar.forMonth(loadedCalendarData,calendarMonth);
         int offset=calendarMonth.atDay(1).getDayOfWeek().getValue()-1;
         int cells=((offset+calendarMonth.lengthOfMonth()+6)/7)*7;
         for(int start=0;start<cells;start+=7){
@@ -628,11 +774,11 @@ public final class MainActivity extends Activity {
                 tile.setBackground(shape(chosen?(dark?Color.rgb(59,88,135):Color.rgb(207,224,250)):surface(),8,chosen));
                 tile.addView(label(String.valueOf(dayNo),13,chosen,primary()));
                 LinearLayout marks=horizontal();marks.setGravity(Gravity.CENTER);
-                for(AttendanceState state:new AttendanceState[]{AttendanceState.present,AttendanceState.late,AttendanceState.absent})
-                    if(day.hasAttendance(state)){
-                        View dot=new View(this);dot.setBackground(shape(calendarColor(state),9,false));
-                        LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(dp(5),dp(5));lp.setMargins(dp(1),0,dp(1),0);marks.addView(dot,lp);
-                    }
+                for(JournalCalendar.LessonEvent event:day.events()){
+                    int color=JournalCalendar.isUpcoming(day.date(),event)?cyan:calendarColor(event.attendance());
+                    View dot=new View(this);dot.setBackground(shape(color,9,false));
+                    LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(dp(5),dp(5));lp.setMargins(dp(1),0,dp(1),0);marks.addView(dot,lp);
+                }
                 tile.addView(marks);tile.setOnClickListener(v->{calendarDay=day.date();showCalendarDay(day);});
                 LinearLayout.LayoutParams lp=weight(55);lp.setMargins(dp(1),dp(2),dp(1),dp(2));week.addView(tile,lp);
             }
@@ -642,51 +788,38 @@ public final class MainActivity extends Activity {
         gap(content,8);
         secondary(content,"Нажми на день, чтобы открыть все занятия, оценки и посещаемость.");
     }
-    private void showCalendarDay(JournalCalendar.Day day) {
-        Dialog dialog = new Dialog(this);
-        LinearLayout sheet = vertical();
-        sheet.setBackground(shape(surface(),22,true));sheet.setPadding(dp(20),dp(20),dp(20),dp(24));
-        LinearLayout heading = horizontal();
-        TextView title = label(day.date().format(dateFormat),19,true,primary());
-        heading.addView(title,new LinearLayout.LayoutParams(0,-2,1));
-        heading.addView(button("Закрыть",dialog::dismiss,false),new LinearLayout.LayoutParams(-2,dp(42)));
-        sheet.addView(heading);gap(sheet,15);
-        ScrollView scroll = new ScrollView(this);
-        LinearLayout events = vertical();
-        if(day.events().isEmpty())secondary(events,"На выбранный день записей нет.");
-        for(JournalCalendar.LessonEvent event:day.events()){
-            LinearLayout entry=vertical();entry.setBackground(shape(cardColor(),13,true));pad(entry,13);
-            LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,-2);lp.bottomMargin=dp(10);
-            TextView subject=label(event.subject(),16,true,primary());entry.addView(subject);
-            if(!event.time().isBlank())secondary(entry,event.time());
-            if(event.attendance()!=AttendanceState.unknown){
-                TextView state=label(event.attendance().label(),13,true,calendarColor(event.attendance()));
-                entry.addView(state);
-            }
-            for(Grade grade:event.grades()){
-                TextView mark=label(grade.type()+": "+grade.value(),13,true,accent);
-                entry.addView(mark);
-            }
-            events.addView(entry,lp);
+    private void fetchCalendarMonth(){
+        if(source==null || calendarLoading || calendarMonth.equals(loadedCalendarMonth))return;
+        calendarLoading=true;
+        YearMonth requested=calendarMonth;
+        work(()->source.loadCalendarMonth(requested),month->{
+            calendarLoading=false;
+            if(!requested.equals(calendarMonth)) {fetchCalendarMonth();return;}
+            loadedCalendarData=month;loadedCalendarMonth=requested;
+            if("Календарь".equals(currentPage) && openedCalendarDay==null)showPage();
+        },error->{calendarLoading=false;toast("Не удалось загрузить календарь: "+safeError(error));});
+    }
+    private void showCalendarDay(JournalCalendar.Day day) { openedCalendarDay=day;showPage(); }
+    private void showCalendarDayPage(JournalCalendar.Day day){
+        Button back=button("‹  Календарь",()->{openedCalendarDay=null;showPage();},false);
+        content.addView(back,new LinearLayout.LayoutParams(-1,dp(49)));gap(content,14);
+        txt(content,day.date().format(dateFormat),21,true);gap(content,12);
+        if(day.events().isEmpty())secondary(content,"Занятий нет.");
+        for(JournalCalendar.LessonEvent e:day.events()){
+            LinearLayout card=card();txt(card,e.subject(),17,true);
+            secondary(card,e.time());
+            if(e.teacher()!=null&&!e.teacher().isBlank())secondary(card,e.teacher());
+            if(e.room()!=null&&!e.room().isBlank())secondary(card,e.room());
+            boolean future=JournalCalendar.isUpcoming(day.date(),e);
+            card.addView(label(future?"Предстоит":e.attendance().label(),13,true,
+                future?cyan:calendarColor(e.attendance())));
+            for(Grade mark:e.grades())card.addView(label(mark.type()+": "+mark.value(),13,true,accent));
+            content.addView(card);
         }
-        scroll.addView(events);
-        // A bottom sheet must not extend beyond the phone viewport on busy days.
-        int viewport = getResources().getDisplayMetrics().heightPixels;
-        int required = Math.max(dp(70), day.events().size()*dp(110));
-        sheet.addView(scroll,new LinearLayout.LayoutParams(-1,Math.min(Math.min(dp(440),viewport*3/5),required)));
-        dialog.setContentView(sheet);
-        android.view.Window window=dialog.getWindow();
-        if(window!=null){
-            window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            window.addFlags(android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND);
-            window.setDimAmount(0.48f);
-        }
-        dialog.show();
-        window=dialog.getWindow();
-        if(window!=null){
-            window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-            window.setLayout(ViewGroup.LayoutParams.MATCH_PARENT,ViewGroup.LayoutParams.WRAP_CONTENT);
-            window.setGravity(Gravity.BOTTOM);
+        if(!day.unmatchedGrades().isEmpty()){
+            LinearLayout extra=card();txt(extra,"Оценки без привязки к паре",14,true);
+            for(Grade g:day.unmatchedGrades())secondary(extra,g.subject()+" · "+g.type()+": "+g.value());
+            content.addView(extra);
         }
     }
     private int calendarColor(AttendanceState status) {return switch(status){
@@ -694,23 +827,43 @@ public final class MainActivity extends Activity {
     };}
     private void profile() {
         LinearLayout info=card();txt(info,data.profile().name(),22,true);secondary(info,data.profile().group());content.addView(info);
-        Button theme=button(dark?"Светлая тема":"Тёмная тема",()->{
-            dark=!dark;getWindow().setStatusBarColor(background());getWindow().setNavigationBarColor(background());showPage();
-        },false);content.addView(theme,new LinearLayout.LayoutParams(-1,dp(48)));gap(content,13);
         content.addView(button("Выйти из аккаунта",()->new AlertDialog.Builder(this)
             .setTitle("Выйти из аккаунта?").setNegativeButton("Отмена",null)
             .setPositiveButton("Выйти",(d,w)->{sessions.clear();source=null;data=null;showLogin(null);}).show(),false),
             new LinearLayout.LayoutParams(-1,dp(48)));
-        gap(content,22);TextView version=label("JavaJournal · "+BuildConfig.VERSION_NAME,12,false,muted());
-        version.setGravity(Gravity.RIGHT);content.addView(version);
+
     }
     private void settings() {
         LinearLayout p=card();txt(p,"Настройки",20,true);gap(p,10);
         p.addView(button(dark?"Светлая тема":"Тёмная тема",()->{
             dark=!dark;getWindow().setStatusBarColor(background());getWindow().setNavigationBarColor(background());showPage();
         },false),new LinearLayout.LayoutParams(-1,dp(48)));gap(p,12);
-        p.addView(button("Обновить данные",this::refresh,false),new LinearLayout.LayoutParams(-1,dp(48)));
+        p.addView(label("JavaJournal · " + BuildConfig.VERSION_NAME,13,false,muted()));gap(p,12);
+        p.addView(button("Проверить обновления",()->checkUpdates(true),false),new LinearLayout.LayoutParams(-1,dp(48)));
         content.addView(p);
+    }
+    private void checkUpdates(boolean manual){
+        if(!manual && checkedUpdates)return;
+        checkedUpdates=true;
+        work(()->ReleaseUpdates.checkLatest("PaCcBeTu3aKaT/JavaJournal",BuildConfig.VERSION_NAME,
+            "Android",android.os.Build.SUPPORTED_ABIS[0]),release->{
+            if(!release.available()){if(manual)toast("Установлена актуальная версия.");return;}
+            new AlertDialog.Builder(this).setTitle("Доступна версия "+release.version())
+                .setMessage("Загрузить обновление JavaJournal?")
+                .setNegativeButton("Позже",null)
+                .setPositiveButton("Скачать",(d,w)->{
+                    String url=release.downloadUrl().isBlank()?release.pageUrl():release.downloadUrl();
+                    startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse(url)));
+                }).show();
+        },error->{if(manual)toast("Не удалось проверить обновления: "+safeError(error));});
+    }
+    private long backgroundedAt;
+    @Override protected void onStop(){backgroundedAt=System.currentTimeMillis();super.onStop();}
+    @Override protected void onResume(){
+        super.onResume();
+        if(backgroundedAt>0 && System.currentTimeMillis()-backgroundedAt>120000
+            && source!=null && !fetching && !submitting && selectedHomework==null && openedCalendarDay==null)refresh();
+        backgroundedAt=0;
     }
     @Override protected void onDestroy() {executor.shutdownNow();super.onDestroy();}
 }

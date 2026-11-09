@@ -124,6 +124,7 @@ public final class ReleaseUpdates {
         String file = filename.toLowerCase(Locale.ROOT);
         String os = osName.toLowerCase(Locale.ROOT);
         String arch = architecture.toLowerCase(Locale.ROOT);
+        if (os.contains("android")) return file.endsWith(".apk") ? 10 : -1;
         if (!file.endsWith(".zip") || file.contains("source") || file.contains("legacy")) return -1;
         if (os.contains("windows")) {
             if (!(file.contains("windows") || file.contains("win-"))) return -1;

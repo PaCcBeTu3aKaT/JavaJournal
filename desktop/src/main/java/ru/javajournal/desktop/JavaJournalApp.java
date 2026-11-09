@@ -2,6 +2,8 @@ package ru.javajournal.desktop;
 
 import javafx.application.Application;
 import javafx.application.Platform;
+import javafx.animation.*;
+import javafx.util.Duration;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Node;
@@ -23,6 +25,7 @@ import javafx.scene.input.KeyCode;
 import ru.javajournal.core.service.AttachmentLinks;
 import ru.javajournal.core.service.AttachmentInfo;
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import ru.javajournal.core.api.TopAcademySource;
@@ -32,6 +35,7 @@ import ru.javajournal.core.service.JournalFilters;
 import ru.javajournal.core.service.JournalDisplay;
 import ru.javajournal.core.service.JournalCalendar;
 import ru.javajournal.core.service.ReleaseUpdates;
+import ru.javajournal.core.service.WorkSubmission;
 import javafx.beans.binding.Bindings;
 
 import java.time.LocalDate;
@@ -40,6 +44,8 @@ import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.TextStyle;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.Set;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -55,7 +61,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Desktop GUI не блокирует JavaFX Thread во время сетевых операций.
  */
 public final class JavaJournalApp extends Application {
-    private enum Page { overview, schedule, homework, grades, attendance, calendar, profile }
+    private enum Page { overview, schedule, homework, grades, attendance, calendar, calendarDay, profile, settings }
     private record Palette(String bg, String surface, String raised, String border,
                            String text, String muted, String accent, String accentDim,
                            String green, String greenDim, String amber, String amberDim,
@@ -82,12 +88,22 @@ public final class JavaJournalApp extends Application {
     private String loadError = "";
     private String homeworkFilter = "Все";
     private boolean homeworkTiles = false;
+    private int taskType = 0;
+    private List<Homework> labs = List.of();
+    private boolean labsLoading = false;
+    private JournalData calendarData;
+    private YearMonth loadedCalendarMonth;
+    private JournalCalendar.Day openedCalendarDay;
     private JournalFilters.HomeworkSort homeworkSort = JournalFilters.HomeworkSort.dueAscending;
     private JournalFilters.Period statsPeriod = JournalFilters.Period.month;
     private LocalDate statsDate = LocalDate.now();
     private YearMonth calendarMonth = YearMonth.now();
     private boolean checkingUpdates = false;
     private boolean updateNoticeShown = false;
+    private StackPane currentHost;
+    private HBox floatingStatus;
+    private PauseTransition statusDelay;
+    private Label statusText;
 
     @Override public void start(Stage primaryStage) {
         stage = primaryStage;
@@ -97,10 +113,41 @@ public final class JavaJournalApp extends Application {
         try (var stream = JavaJournalApp.class.getResourceAsStream("/icons/javajournal.png")) {
             if (stream != null) stage.getIcons().add(new Image(stream));
         } catch (java.io.IOException ignored) { }
-        showLogin();
+        CredentialStore.Credentials saved = CredentialStore.load();
+        if (saved == null) showLogin();
+        else restoreLogin(saved);
         stage.show();
         // Не блокируем окно входа: проверка публичного GitHub Release идёт в фоне.
         checkUpdates(false, null);
+    }
+
+    private void restoreLogin(CredentialStore.Credentials saved){
+        Palette p=palette();
+        VBox shell=column(22,title("Главная",27),muted("Восстанавливаем сессию...",14));
+        shell.setPadding(new Insets(42));shell.setStyle("-fx-background-color: "+p.bg+";");
+        StackPane host=new StackPane(shell);
+        HBox indicator=row(10,new ProgressIndicator(),text("Вход...",13,true,p.text));
+        indicator.setAlignment(Pos.CENTER);indicator.setPadding(new Insets(10,19,10,19));
+        indicator.setStyle(boxStyle(p.surface,30,true));
+        StackPane.setAlignment(indicator,Pos.TOP_CENTER);StackPane.setMargin(indicator,new Insets(14));
+        host.getChildren().add(indicator);
+        setScene(host,1100,760);
+        CompletableFuture.supplyAsync(()->{
+            try{
+                if(saved.token()!=null&&!saved.token().isBlank())try{
+                    return TopAcademySource.restoreSession(saved.token());
+                }catch(TopAcademySource.AuthException invalid){}
+                return TopAcademySource.login(saved.username(),saved.password());
+            }catch(Exception e){throw new CompletionException(e);}
+        },executor).whenComplete((restored,failure)->Platform.runLater(()->{
+            if(failure!=null){showLogin();return;}
+            source=restored;
+            CompletableFuture.runAsync(()->{
+                try{CredentialStore.save(saved.username(),saved.password(),restored.sessionToken());}
+                catch(Exception ignored){}
+            },executor);
+            page=Page.overview;requestData(false);
+        }));
     }
 
     @Override public void stop() { executor.shutdownNow(); }
@@ -226,6 +273,10 @@ public final class JavaJournalApp extends Application {
                 return;
             }
             source = result;
+            CompletableFuture.runAsync(()->{
+                try{CredentialStore.save(username,passwordValue,result.sessionToken());}
+                catch(Exception ignored){}
+            },executor);
             data = null;
             selectedDate = JournalDisplay.startingWeekDate(LocalDate.now());
             weekMode = true;
@@ -279,6 +330,8 @@ public final class JavaJournalApp extends Application {
         loading = true;
         loadError = "";
         drawApp();
+        scheduleStatus(false);
+        if(force)loadedCalendarMonth=null;
         JournalSource current = source;
         LocalDate day = selectedDate;
         boolean week = weekMode;
@@ -290,10 +343,73 @@ public final class JavaJournalApp extends Application {
         }, executor).whenComplete((value, failure) -> Platform.runLater(() -> {
             if (id != requestSequence.get() || source != current) return;
             loading = false;
-            if (failure != null) loadError = safeError(failure);
+            if (failure != null) {
+                Throwable cause=failure;
+                while(cause.getCause()!=null)cause=cause.getCause();
+                if(cause instanceof TopAcademySource.AuthException){restoreAfterExpiry();return;}
+                loadError = safeError(failure);
+            }
             else { data = value; loadError = ""; }
+            hideStatus();
             drawApp();
+            if(page==Page.calendar)fetchCalendar(false);
         }));
+    }
+
+    private boolean restoringAfterExpiry = false;
+    private void restoreAfterExpiry(){
+        if(restoringAfterExpiry)return;
+        restoringAfterExpiry=true;
+        loading=true;loadError="Вход...";drawApp();scheduleStatus(true);
+        CompletableFuture.supplyAsync(()->{
+            try{
+                CredentialStore.Credentials credentials=CredentialStore.load();
+                if(credentials==null)throw new IOException("Сохранённые данные входа отсутствуют.");
+                TopAcademySource newSource=TopAcademySource.login(credentials.username(),credentials.password());
+                CredentialStore.save(credentials.username(),credentials.password(),newSource.sessionToken());
+                return newSource;
+            }catch(Exception error){throw new CompletionException(error);}
+        },executor).whenComplete((restored,failure)->Platform.runLater(()->{
+            restoringAfterExpiry=false;
+            if(failure!=null){source=null;loading=false;hideStatus();showLogin();return;}
+            source=restored;requestData(false);
+        }));
+    }
+
+    private void scheduleStatus(boolean login){
+        if(statusDelay!=null)statusDelay.stop();
+        statusDelay=new PauseTransition(Duration.seconds(1));
+        statusDelay.setOnFinished(e->{if(loading)showStatus(login?"Вход...":"Обновление...");});
+        statusDelay.play();
+    }
+    private void showStatus(String message){
+        if(currentHost==null)return;
+        if(floatingStatus!=null){if(statusText!=null)statusText.setText(message);return;}
+        ProgressIndicator spinner=new ProgressIndicator();spinner.setPrefSize(18,18);
+        statusText=text(message,13,true,palette().text);
+        HBox banner=row(9,spinner,statusText);
+        banner.setAlignment(Pos.CENTER);banner.setPadding(new Insets(9,19,9,19));
+        banner.setStyle(boxStyle(palette().surface,30,true));
+        banner.setOpacity(0);banner.setTranslateY(-70);
+        currentHost.getChildren().add(banner);
+        StackPane.setAlignment(banner,Pos.TOP_CENTER);StackPane.setMargin(banner,new Insets(10));
+        floatingStatus=banner;
+        FadeTransition fade=new FadeTransition(Duration.millis(190),banner);fade.setToValue(1);
+        TranslateTransition move=new TranslateTransition(Duration.millis(190),banner);move.setToY(0);
+        new ParallelTransition(fade,move).play();
+    }
+    private void hideStatus(){
+        if(statusDelay!=null)statusDelay.stop();
+        HBox banner=floatingStatus;
+        if(banner==null)return;
+        FadeTransition fade=new FadeTransition(Duration.millis(210),banner);fade.setToValue(0);
+        TranslateTransition move=new TranslateTransition(Duration.millis(210),banner);move.setToY(-70);
+        ParallelTransition exit=new ParallelTransition(fade,move);
+        exit.setOnFinished(e->{
+            if(banner.getParent() instanceof Pane parent)parent.getChildren().remove(banner);
+            if(floatingStatus==banner)floatingStatus=null;
+        });
+        exit.play();
     }
 
     private static String safeError(Throwable t) {
@@ -331,7 +447,15 @@ public final class JavaJournalApp extends Application {
         VBox.setVgrow(scroll, Priority.ALWAYS);
         area.getChildren().add(scroll);
         root.setCenter(area);
-        setScene(root, 1280, 820);
+        StackPane host=new StackPane(root);
+        if(floatingStatus != null){
+            if(floatingStatus.getParent() instanceof Pane parent)parent.getChildren().remove(floatingStatus);
+            host.getChildren().add(floatingStatus);
+            StackPane.setAlignment(floatingStatus,Pos.TOP_CENTER);
+            StackPane.setMargin(floatingStatus,new Insets(10));
+        }
+        currentHost=host;
+        setScene(host, 1280, 820);
     }
 
     private VBox sidebar() {
@@ -355,11 +479,13 @@ public final class JavaJournalApp extends Application {
         addMenu(panel, "Посещаемость", Page.attendance);
         addMenu(panel, "Календарь", Page.calendar);
         addMenu(panel, "Профиль", Page.profile);
+        addMenu(panel, "Настройки", Page.settings);
         Region vSpacer = new Region();
         VBox.setVgrow(vSpacer, Priority.ALWAYS);
         panel.getChildren().add(vSpacer);
         Button exit = subtle("Выйти", () -> {
             requestSequence.incrementAndGet();
+            CredentialStore.clear();
             source = null;
             data = null;
             loading = false;
@@ -395,6 +521,7 @@ public final class JavaJournalApp extends Application {
         item.setOnMouseExited(e -> item.setStyle(normal + "-fx-cursor: hand;"));
         item.setOnMouseClicked(e -> {
             page = target;
+            if(target == Page.calendar)fetchCalendar(false);
             if (target == Page.schedule || target == Page.overview) {
                 selectedDate = JournalDisplay.startingWeekDate(LocalDate.now());
                 weekMode = true;
@@ -412,9 +539,7 @@ public final class JavaJournalApp extends Application {
         bar.setPadding(new Insets(17, 34, 17, 34));
         bar.setStyle("-fx-background-color: " + p.surface + "; -fx-border-color: " + p.border + "; -fx-border-width: 0 0 1 0;");
         bar.getChildren().add(spacer());
-        Button theme = subtle(light ? "Тёмная тема" : "Светлая тема", () -> { light = !light; drawApp(); });
-        bar.getChildren().add(theme);
-        Button refresh = button(loading ? "Обновление..." : "Обновить", true, () -> requestData(true));
+        Button refresh = button(restoringAfterExpiry ? "Вход..." : loading ? "Обновление..." : "Обновить", true, () -> requestData(true));
         refresh.setDisable(loading);
         bar.getChildren().add(refresh);
         return bar;
@@ -429,7 +554,9 @@ public final class JavaJournalApp extends Application {
             case grades -> "Оценки";
             case attendance -> "Посещаемость";
             case calendar -> "Календарь";
+            case calendarDay -> openedCalendarDay==null?"Занятия":openedCalendarDay.date().format(fullDate);
             case profile -> "Мой профиль";
+            case settings -> "Настройки";
         };
         out.add(title(heading, 28));
         if (!loadError.isBlank()) out.add(warning("Не удалось обновить данные: " + loadError));
@@ -455,7 +582,9 @@ public final class JavaJournalApp extends Application {
             case grades -> grades(out);
             case attendance -> attendance(out);
             case calendar -> calendar(out);
+            case calendarDay -> calendarDay(out);
             case profile -> profile(out);
+            case settings -> settings(out);
         }
         return out;
     }
@@ -658,11 +787,16 @@ public final class JavaJournalApp extends Application {
     }
 
     private void homework(List<Node> out) {
+        HBox types = row(9,
+            toggle("Домашние", taskType==0, ()->{taskType=0;drawApp();}),
+            toggle("Лабораторные", taskType==1, ()->{taskType=1;drawApp();fetchLabs(false);}));
+        out.add(types);
+        if(taskType==1 && labsLoading)out.add(muted("Загружаем лабораторные работы...",12));
         // Единая линия управления: фильтры слева, сортировка и вид справа.
         // При узком окне панель прокручивается по горизонтали, но не разваливается на две строки.
         HBox filters = row(7);
         filters.setAlignment(Pos.CENTER_LEFT);
-        for (String filter : List.of("Все", "Активно", "Просрочено", "На проверке", "Проверено")) {
+        for (String filter : List.of("Все", "Активно", "Просрочено", "На проверке", "Проверено", "Удалено")) {
             filters.getChildren().add(toggle(filter, filter.equals(homeworkFilter), () -> {
                 homeworkFilter = filter;
                 drawApp();
@@ -701,12 +835,13 @@ public final class JavaJournalApp extends Application {
         out.add(toolbarScroll);
         addWarning(out, "homework");
 
-        List<Homework> visible = data.homework().stream().filter(task -> switch (homeworkFilter) {
+        List<Homework> visible = (taskType==0?data.homework():labs).stream().filter(task -> switch (homeworkFilter) {
             case "Активно" -> task.status() == HomeworkStatus.pending;
             case "Просрочено" -> task.status() == HomeworkStatus.overdue;
             case "На проверке" -> task.status() == HomeworkStatus.review;
             case "Проверено" -> task.status() == HomeworkStatus.done;
-            default -> task.status() != HomeworkStatus.deleted;
+            case "Удалено" -> task.status() == HomeworkStatus.deleted;
+            default -> true;
         }).toList();
         if (visible.isEmpty()) {
             out.add(blankState("Заданий с выбранным статусом нет."));
@@ -745,6 +880,21 @@ public final class JavaJournalApp extends Application {
             }
             out.add(section);
         }
+    }
+
+    private void fetchLabs(boolean force){
+        if(source==null || labsLoading)return;
+        labsLoading=true;
+        JournalSource requested=source;
+        CompletableFuture.supplyAsync(()->{
+            try{if(force)requested.refresh();return requested.loadHomework(1);}
+            catch(Exception e){throw new CompletionException(e);}
+        },executor).whenComplete((results,failure)->Platform.runLater(()->{
+            if(source!=requested)return;
+            labsLoading=false;
+            if(failure==null){labs=results; if(page==Page.homework)drawApp();}
+            else if(page==Page.homework)loadError="Лабораторные: "+safeError(failure);
+        }));
     }
 
     private Pane homeworkItems(List<Homework> tasks, boolean groupedBySubject) {
@@ -945,77 +1095,7 @@ public final class JavaJournalApp extends Application {
                 body.getChildren().add(retake);
             }
         } else {
-        VBox answer = card(12);
-        answer.getChildren().add(title("Мой ответ", 16));
-        TextArea reply = new TextArea();
-        reply.setWrapText(true);
-        reply.setPromptText("Текстовый ответ на домашнее задание...");
-        reply.setPrefRowCount(4);
-        reply.setMinHeight(90);
-        reply.setStyle("-fx-control-inner-background: " + colors.raised + "; "
-            + "-fx-background-color: " + colors.raised + "; -fx-text-fill: " + colors.text + "; "
-            + "-fx-prompt-text-fill: " + colors.muted + "; -fx-font-size: 13px; "
-            + "-fx-background-radius: 10; -fx-border-color: " + colors.border + "; -fx-border-radius: 10;");
-        answer.getChildren().add(reply);
-
-        Label selectedLabel = muted("Файл не выбран", 12);
-        Button selectFile = subtle("Выбрать файл", () -> { });
-        selectFile.setOnAction(event -> {
-            FileChooser chooser = new FileChooser();
-            chooser.setTitle("Выберите выполненную домашнюю работу");
-            File selected = chooser.showOpenDialog(details);
-            if (selected == null) return;
-            String lower = selected.getName().toLowerCase(java.util.Locale.ROOT);
-            if (lower.endsWith(".txt") || lower.endsWith(".csv")) {
-                selectedLabel.setText("Форматы .txt и .csv не принимаются официальным журналом.");
-                selectedLabel.setStyle("-fx-text-fill: " + colors.red + "; -fx-font-size: 12px;");
-                return;
-            }
-            selectedLabel.setText(selected.getName() + " — выбран локально, не отправлен");
-            selectedLabel.setStyle("-fx-text-fill: " + colors.muted + "; -fx-font-size: 12px;");
-        });
-        HBox selectRow = row(12, selectFile, selectedLabel);
-        selectRow.setAlignment(Pos.CENTER_LEFT);
-        answer.getChildren().add(selectRow);
-
-        Label timeLabel = muted("Время выполнения (чч:мм)", 12);
-        TextField duration = new TextField();
-        duration.setPromptText("00:00");
-        duration.setMaxWidth(135);
-        styleInput(duration);
-        HBox timing = row(14, timeLabel, duration);
-        timing.setAlignment(Pos.CENTER_LEFT);
-        answer.getChildren().add(timing);
-
-        HBox rating = row(7);
-        rating.setAlignment(Pos.CENTER_LEFT);
-        rating.getChildren().add(muted("Оценка полезности занятия", 12));
-        final int[] chosenScore = {0};
-        List<Button> ratingButtons = new ArrayList<>();
-        for (int i = 1; i <= 5; i++) {
-            final int value = i;
-            Button point = subtle("○", () -> { });
-            point.setMinWidth(30);
-            point.setPrefWidth(30);
-            point.setPadding(new Insets(5));
-            point.setOnAction(event -> {
-                chosenScore[0] = value;
-                for (int position = 0; position < ratingButtons.size(); position++) {
-                    ratingButtons.get(position).setText(position < value ? "●" : "○");
-                }
-            });
-            ratingButtons.add(point);
-            rating.getChildren().add(point);
-        }
-        answer.getChildren().add(rating);
-
-        Button disabledSend = button("Отправить на проверку", true, () -> { });
-        disabledSend.setDisable(true);
-        disabledSend.setTooltip(new Tooltip("Отправка пока недоступна: требуется проверенный API-метод"));
-        full(disabledSend);
-        answer.getChildren().addAll(disabledSend,
-            muted("Отправка пока недоступна. Текст и выбранный файл не передаются на сервер.", 12));
-        body.getChildren().add(answer);
+            body.getChildren().add(buildSubmissionForm(task,details));
 
         }
 
@@ -1023,8 +1103,106 @@ public final class JavaJournalApp extends Application {
         scroll.setFitToWidth(true);
         scroll.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
         scroll.setStyle("-fx-background: " + colors.bg + "; -fx-background-color: " + colors.bg + "; -fx-border-width: 0;");
-        details.setScene(new Scene(scroll, 720, 745));
+        details.setScene(new Scene(scroll, 910, 755));
         details.show();
+    }
+
+    private Node buildSubmissionForm(Homework task, Stage details){
+        Palette colors=palette();
+        List<Path> files=new ArrayList<>();
+        VBox left=card(13),right=card(12);
+        left.getChildren().add(title("Прикреплённые файлы",16));
+        VBox fileList=column(7);
+        Label fileHint=muted("Файлы будут архивированы после нажатия «Отправить».",11);
+        Button select=subtle("Добавить файлы",()->{});
+        select.setOnAction(e->{
+            FileChooser chooser=new FileChooser();chooser.setTitle("Выбрать файлы для работы");
+            List<File> picked=chooser.showOpenMultipleDialog(details);
+            if(picked==null)return;
+            for(File file:picked)if(!files.contains(file.toPath()))files.add(file.toPath());
+            updateSelectedFiles(fileList,files,colors);
+        });
+        left.getChildren().addAll(select,fileList,fileHint);
+        left.getChildren().add(title("Текстовый ответ",16));
+        TextArea reply=new TextArea();reply.setWrapText(true);reply.setPromptText("Текст или ссылка на выполненную работу...");
+        reply.setPrefRowCount(5);reply.setMinHeight(130);
+        reply.setStyle("-fx-control-inner-background: "+colors.raised+"; -fx-text-fill: "+colors.text+";");
+        left.getChildren().add(reply);
+        right.getChildren().add(title("Время выполнения",16));
+        TextField hours=new TextField("0"),minutes=new TextField("30");
+        hours.setPromptText("Часы");minutes.setPromptText("Минуты");
+        hours.setPrefWidth(82);minutes.setPrefWidth(82);styleInput(hours);styleInput(minutes);
+        right.getChildren().add(row(9,muted("Часы",12),hours,muted("Минуты",12),minutes));
+        right.getChildren().add(title("Оценка задания",16));
+        HBox stars=row(3);final int[] rating={0};List<Button> ratingButtons=new ArrayList<>();
+        for(int i=1;i<=5;i++){
+            int choice=i;Button b=subtle("☆",()->{});b.setMinWidth(38);b.setPrefWidth(38);
+            b.setOnAction(e->{rating[0]=choice;
+                for(int j=0;j<ratingButtons.size();j++)ratingButtons.get(j).setText(j<choice?"★":"☆");});
+            stars.getChildren().add(b);ratingButtons.add(b);
+        }
+        right.getChildren().add(stars);
+        right.getChildren().add(title("Впечатления",15));
+        String[] labels={"Всё круто!","Всё понятно!","Скучно :(","Задание слишком сложное",
+            "Мне нравится","Не понятно, но нужно было сделать","Задание слишком простое"};
+        Set<Integer> tags=new LinkedHashSet<>();
+        FlowPane chips=new FlowPane(5,7);chips.setPrefWrapLength(245);
+        for(int i=0;i<labels.length;i++){
+            int tag=i+1;Button chip=subtle(labels[i],()->{});
+            chip.setStyle("-fx-background-color: "+colors.raised+"; -fx-text-fill: "+colors.text+"; -fx-background-radius: 9;");
+            chip.setOnAction(e->{if(!tags.add(tag))tags.remove(tag);
+                chip.setStyle("-fx-background-color: "+(tags.contains(tag)?colors.accentDim:colors.raised)
+                    +"; -fx-text-fill: "+colors.text+"; -fx-background-radius: 9;");});
+            chips.getChildren().add(chip);
+        }
+        right.getChildren().add(chips);
+        right.getChildren().add(title("Комментарий (необязательно)",13));
+        TextArea comment=new TextArea();comment.setWrapText(true);comment.setPrefRowCount(2);
+        comment.setStyle("-fx-control-inner-background: "+colors.raised+"; -fx-text-fill: "+colors.text+";");
+        right.getChildren().add(comment);
+        Label message=muted("",12);
+        Button send=button("Отправить работу",true,()->{});full(send);
+        send.setOnAction(e->{
+            try{
+                int hour=Integer.parseInt(hours.getText().strip());
+                int minute=Integer.parseInt(minutes.getText().strip());
+                List<WorkSubmission.Attachment> attachments=new ArrayList<>();
+                for(Path file:files)attachments.add(new WorkSubmission.Attachment(file.getFileName().toString(),
+                    ()->Files.newInputStream(file)));
+                WorkSubmission.Form form=new WorkSubmission.Form(task.id(),task.workType(),attachments,
+                    reply.getText(),hour,minute,rating[0],new ArrayList<>(tags),comment.getText());
+                send.setDisable(true);message.setText("Отправляем работу...");
+                JournalSource active=source;
+                CompletableFuture.supplyAsync(()->{
+                    try{return active.submitWork(form);}catch(Exception ex){throw new CompletionException(ex);}
+                },executor).whenComplete((result,failure)->Platform.runLater(()->{
+                    if(!details.isShowing())return;
+                    if(failure!=null){send.setDisable(false);message.setText("Ошибка: "+safeError(failure));return;}
+                    details.close();
+                    if(task.workType()==1)fetchLabs(true);
+                    requestData(true);
+                    Alert notification=new Alert(result.reviewSaved()?Alert.AlertType.INFORMATION:Alert.AlertType.WARNING,
+                        result.message(),ButtonType.OK);
+                    notification.initOwner(stage);notification.show();
+                }));
+            }catch(Exception invalid){message.setText("Проверь поля: "+safeError(invalid));}
+        });
+        right.getChildren().addAll(message,send);
+        HBox layout=row(15,left,right);
+        HBox.setHgrow(left,Priority.ALWAYS);left.setMaxWidth(Double.MAX_VALUE);
+        right.setPrefWidth(310);right.setMinWidth(300);right.setMaxWidth(340);
+        return layout;
+    }
+    private void updateSelectedFiles(VBox list,List<Path> files,Palette colors){
+        list.getChildren().clear();
+        if(files.isEmpty()){list.getChildren().add(muted("Файлы не выбраны",12));return;}
+        list.getChildren().add(muted(files.size()>1?"Будет создан ZIP из "+files.size()+" файлов":
+            "Выбран один файл — отправится без архивации",12));
+        for(Path file:new ArrayList<>(files)){
+            HBox row=row(8,muted(file.getFileName().toString(),12),spacer());
+            row.getChildren().add(subtle("Удалить",()->{files.remove(file);updateSelectedFiles(list,files,colors);}));
+            list.getChildren().add(row);
+        }
     }
 
     private void attachmentRow(VBox target, String caption, String url, String apiFilename,
@@ -1229,21 +1407,28 @@ public final class JavaJournalApp extends Application {
         Palette p = palette();
         HBox controls = row(12);
         controls.setAlignment(Pos.CENTER_LEFT);
-        controls.getChildren().add(subtle("‹", () -> { calendarMonth = calendarMonth.minusMonths(1); drawApp(); }));
+        controls.getChildren().add(subtle("‹", () -> { calendarMonth = calendarMonth.minusMonths(1); drawApp();fetchCalendar(false); }));
         Label month = title(capitalize(calendarMonth.getMonth().getDisplayName(TextStyle.FULL_STANDALONE, russianLocale))
             + " " + calendarMonth.getYear(), 19);
         month.setMinWidth(220);
         month.setAlignment(Pos.CENTER);
         controls.getChildren().add(month);
-        controls.getChildren().add(subtle("›", () -> { calendarMonth = calendarMonth.plusMonths(1); drawApp(); }));
-        controls.getChildren().add(subtle("Сегодня", () -> { calendarMonth = YearMonth.now(); drawApp(); }));
+        controls.getChildren().add(subtle("›", () -> { calendarMonth = calendarMonth.plusMonths(1); drawApp();fetchCalendar(false); }));
+        controls.getChildren().add(subtle("Сегодня", () -> { calendarMonth = YearMonth.now(); drawApp();fetchCalendar(false); }));
         out.add(controls);
-        HBox legend = row(18,
+        FlowPane legend = new FlowPane(12,8);
+        legend.setAlignment(Pos.CENTER_LEFT);
+        legend.getChildren().addAll(
             pill("● Присутствовал", p.green, p.greenDim),
             pill("● Опоздал", p.amber, p.amberDim),
-            pill("● Отсутствовал", p.red, p.redDim));
+            pill("● Отсутствовал", p.red, p.redDim),
+            pill("● Предстоит", "#77AFFF",p.accentDim),
+            pill("● Неизвестно",p.muted,p.raised));
         out.add(legend);
         VBox panel = card(13);
+        if(loadedCalendarMonth==null || !loadedCalendarMonth.equals(calendarMonth)){
+            out.add(muted("Загружаем расписание месяца...",12));
+        }
         GridPane grid = new GridPane();
         grid.setHgap(7);
         grid.setVgap(7);
@@ -1260,20 +1445,28 @@ public final class JavaJournalApp extends Application {
             grid.add(day,i,0);
         }
         int offset = calendarMonth.atDay(1).getDayOfWeek().getValue()-1;
-        for (JournalCalendar.Day day : JournalCalendar.forMonth(data, calendarMonth)) {
+        for (JournalCalendar.Day day : JournalCalendar.forMonth(
+            loadedCalendarMonth!=null && loadedCalendarMonth.equals(calendarMonth)?calendarData:data, calendarMonth)) {
             int pos = offset + day.date().getDayOfMonth()-1;
             VBox tile = column(9);
+            tile.setAlignment(Pos.TOP_CENTER);
             tile.setPadding(new Insets(12));
             tile.setMinHeight(85);
             tile.setMaxWidth(Double.MAX_VALUE);
             boolean today = day.date().equals(LocalDate.now());
             tile.setStyle(boxStyle(today?p.accentDim:p.raised, 11, true)+"-fx-cursor: hand;");
             Label number = title(String.valueOf(day.date().getDayOfMonth()), 15);
-            HBox dots = row(5);
-            if(day.hasAttendance(AttendanceState.present)) dots.getChildren().add(marker(p.green,4));
-            if(day.hasAttendance(AttendanceState.late)) dots.getChildren().add(marker(p.amber,4));
-            if(day.hasAttendance(AttendanceState.absent)) dots.getChildren().add(marker(p.red,4));
-            if(day.hasGrades()) dots.getChildren().add(marker(p.accent,4));
+            FlowPane dots = new FlowPane(5,4);
+            dots.setAlignment(Pos.CENTER);dots.setPrefWrapLength(145);
+            for(JournalCalendar.LessonEvent event:day.events()){
+                String mark=JournalCalendar.isUpcoming(day.date(),event)?"#77AFFF":switch(event.attendance()){
+                    case present -> p.green;
+                    case late -> p.amber;
+                    case absent -> p.red;
+                    case unknown -> p.muted;
+                };
+                dots.getChildren().add(marker(mark,4));
+            }
             tile.getChildren().addAll(number,dots);
             tile.setOnMouseClicked(event -> showCalendarDay(day));
             grid.add(tile,pos%7,pos/7+1);
@@ -1284,37 +1477,52 @@ public final class JavaJournalApp extends Application {
     }
 
     private void showCalendarDay(JournalCalendar.Day day) {
-        Dialog<Void> dialog = new Dialog<>();
-        dialog.initOwner(stage);
-        dialog.setTitle(day.date().format(fullDate));
-        dialog.getDialogPane().getButtonTypes().add(ButtonType.CLOSE);
-        VBox body = column(13);
-        body.setPadding(new Insets(16));
-        body.setPrefWidth(530);
-        body.getChildren().add(title(day.date().format(fullDate),20));
-        if(day.events().isEmpty())body.getChildren().add(muted("На эту дату записей нет.",14));
-        for(JournalCalendar.LessonEvent event:day.events()) {
-            VBox entry = column(7);
-            entry.setPadding(new Insets(14));
-            entry.setStyle(boxStyle(palette().raised,12,true));
-            entry.getChildren().add(title(event.subject(),16));
-            if(!event.time().isBlank())entry.getChildren().add(muted(event.time(),12));
-            String color = switch(event.attendance()) {
+        openedCalendarDay=day;page=Page.calendarDay;drawApp();
+    }
+    private void calendarDay(List<Node> out){
+        if(openedCalendarDay==null){page=Page.calendar;drawApp();return;}
+        JournalCalendar.Day day=openedCalendarDay;
+        out.add(subtle("‹  Назад к календарю",()->{page=Page.calendar;openedCalendarDay=null;drawApp();}));
+        out.add(muted(day.events().size()+" занятий",13));
+        for(JournalCalendar.LessonEvent event:day.events()){
+            VBox card=card(10);card.setMaxWidth(760);
+            card.getChildren().add(title(event.subject(),18));
+            if(!event.time().isBlank())card.getChildren().add(muted(event.time(),13));
+            if(event.teacher()!=null&&!event.teacher().isBlank())card.getChildren().add(muted(event.teacher(),12));
+            if(event.room()!=null&&!event.room().isBlank())card.getChildren().add(muted(event.room(),12));
+            boolean upcoming=JournalCalendar.isUpcoming(day.date(),event);
+            String color=upcoming?"#77AFFF":switch(event.attendance()){
                 case present -> palette().green;
                 case late -> palette().amber;
                 case absent -> palette().red;
                 case unknown -> palette().muted;
             };
-            entry.getChildren().add(text(event.attendance().label(),12,true,color));
-            for(Grade mark:event.grades())entry.getChildren().add(
-                text(mark.type()+": "+mark.value(),13,true,palette().accent));
-            body.getChildren().add(entry);
+            card.getChildren().add(text(upcoming?"Предстоит":event.attendance().label(),13,true,color));
+            for(Grade grade:event.grades())card.getChildren().add(
+                text(grade.type()+": "+grade.value(),13,true,palette().accent));
+            out.add(card);
         }
-        ScrollPane sc = new ScrollPane(body);
-        sc.setFitToWidth(true);
-        sc.setPrefViewportHeight(500);
-        dialog.getDialogPane().setContent(sc);
-        dialog.showAndWait();
+        if(!day.unmatchedGrades().isEmpty()){
+            VBox pending=card(9);pending.getChildren().add(title("Оценки без привязки к паре",15));
+            for(Grade grade:day.unmatchedGrades())pending.getChildren().add(
+                text(grade.subject()+" · "+grade.type()+": "+grade.value(),13,true,palette().accent));
+            out.add(pending);
+        }
+        if(day.events().isEmpty() && day.unmatchedGrades().isEmpty())out.add(blankState("На этот день занятий нет."));
+    }
+    private void fetchCalendar(boolean force){
+        if(source==null)return;
+        if(!force && calendarMonth.equals(loadedCalendarMonth))return;
+        JournalSource active=source;YearMonth requested=calendarMonth;
+        CompletableFuture.supplyAsync(()->{
+            try{if(force)active.refresh();return active.loadCalendarMonth(requested);}
+            catch(Exception ex){throw new CompletionException(ex);}
+        },executor).whenComplete((monthData,failure)->Platform.runLater(()->{
+            if(active!=source || !calendarMonth.equals(requested))return;
+            if(failure==null){calendarData=monthData;loadedCalendarMonth=requested;
+                if(page==Page.calendar)drawApp();}
+            else if(page==Page.calendar)loadError="Календарь: "+safeError(failure);
+        }));
     }
 
     private void profile(List<Node> out) {
@@ -1327,43 +1535,16 @@ public final class JavaJournalApp extends Application {
         header.getChildren().add(info);
         out.add(header);
 
-        VBox updates = card(13);
-        updates.getChildren().add(title("Обновления", 17));
-        Label repository = muted(DesktopVersion.repository().isBlank()
-            ? "Репозиторий GitHub не указан" : DesktopVersion.repository(), 12);
-        updates.getChildren().add(repository);
-        Label result = muted("", 12);
-        Button check = subtle("Проверить обновления", () -> checkUpdates(true, result));
-        Button configure = subtle("Репозиторий GitHub", () -> configureUpdateRepository(repository, result));
-        HBox actions = row(10, check, configure);
-        actions.setAlignment(Pos.CENTER_LEFT);
-        updates.getChildren().addAll(actions, result);
-        out.add(updates);
-
-        Region filler = new Region();
-        VBox.setVgrow(filler, Priority.ALWAYS);
-        out.add(filler);
-        HBox footer = row(8, muted("Версия " + DesktopVersion.current(), 11));
-        footer.setAlignment(Pos.CENTER_RIGHT);
-        out.add(footer);
     }
-
-    private void configureUpdateRepository(Label repositoryLabel, Label result) {
-        TextInputDialog dialog = new TextInputDialog(DesktopVersion.repository());
-        dialog.initOwner(stage);
-        dialog.setTitle("Обновления JavaJournal");
-        dialog.setHeaderText("Публичный репозиторий GitHub");
-        dialog.setContentText("owner/repo:");
-        dialog.showAndWait().ifPresent(value -> {
-            try {
-                DesktopVersion.saveRepository(value);
-                repositoryLabel.setText(DesktopVersion.repository());
-                result.setText("Репозиторий сохранён. Проверяем обновления...");
-                checkUpdates(true, result);
-            } catch (IllegalArgumentException error) {
-                result.setText(error.getMessage());
-            }
-        });
+    private void settings(List<Node> out){
+        VBox preferences=card(15);
+        preferences.getChildren().add(title("Оформление",17));
+        preferences.getChildren().add(subtle(light?"Тёмная тема":"Светлая тема",()->{light=!light;drawApp();}));
+        preferences.getChildren().add(title("Обновления",17));
+        preferences.getChildren().add(muted("JavaJournal · версия "+DesktopVersion.current(),13));
+        Label result=muted("",12);
+        preferences.getChildren().addAll(subtle("Проверить обновления",()->checkUpdates(true,result)),result);
+        out.add(preferences);
     }
 
     private void checkUpdates(boolean manual, Label feedback) {

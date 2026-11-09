@@ -2,6 +2,11 @@ plugins {
     id 'com.android.application' version '8.9.2'
 }
 
+// Derived from the shared journalVersion, so APK upgrades preserve version ordering.
+def journalVersionParts = project.version.toString().tokenize('.')
+def androidVersionCode = journalVersionParts[0].toInteger() * 10000 +
+    journalVersionParts[1].toInteger() * 100 + journalVersionParts[2].toInteger()
+
 android {
     namespace 'ru.javajournal.android'
     compileSdk 35
@@ -10,7 +15,9 @@ android {
         applicationId 'ru.javajournal.android'
         minSdk 26
         targetSdk 34
-        versionCode 20000
+        // Android versionCode must increase monotonically for in-place APK updates.
+        // Example: 3.0.0 -> 30000, 3.0.1 -> 30001.
+        versionCode androidVersionCode
         versionName project.version.toString()
     }
     buildFeatures { buildConfig true }

@@ -13,6 +13,18 @@ public interface JournalSource {
     Profile profile();
     JournalData load(LocalDate date, boolean week) throws Exception;
     default void refresh() { }
+    default JournalData loadCalendarMonth(java.time.YearMonth month) throws Exception {
+        return load(month.atDay(1), true);
+    }
+    default java.util.List<ru.javajournal.core.model.Homework> loadHomework(int type) throws IOException {
+        throw new IOException("Источник не поддерживает этот тип заданий.");
+    }
+    default WorkSubmission.Result submitWork(WorkSubmission.Form form) throws IOException {
+        throw new IOException("Отправка работ не поддерживается источником.");
+    }
+    default WorkSubmission.Result submitWork(WorkSubmission.Form form, Path cacheDirectory) throws IOException {
+        return submitWork(form);
+    }
     /** Необязательная проверка метаданных файла (например, Content-Disposition). */
     default AttachmentInfo inspectAttachment(String url, String apiFilename) throws IOException {
         return new AttachmentInfo(AttachmentLinks.resolveFilename(url, apiFilename, "", "", "вложение"), "");
